@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime output
+*.log
+*.tmp
+
+# Build output
+build/
+build_*/
+firmware/*/build/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Personal settings, written by --write-config
+winborder.json
+# Built executable
+dist/
+*.spec
