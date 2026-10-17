@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from winborder import ipc, model, output, win32
+from winborder import hid, model, output, win32
 
 
 class FakeEngine:
@@ -27,12 +27,12 @@ class FakeEngine:
 class FakeLink:
     def __init__(self, accept: bool = True) -> None:
         self.accept = accept
-        self.frames: list[tuple[int, bytes]] = []
+        self.frames: list[tuple[str, bytes]] = []
 
-    def send(self, msg_type: int, payload: bytes) -> bool:
+    def send(self, kind: str, payload: bytes) -> bool:
         if not self.accept:
             return False
-        self.frames.append((msg_type, payload))
+        self.frames.append((kind, payload))
         return True
 
 
@@ -43,15 +43,16 @@ class TestEffectSink(unittest.TestCase):
         self.sink = output.EffectSink(self.link, self.engine)
 
     def test_send_frame_forwarded(self) -> None:
-        self.sink.apply([model.SendFrame(ipc.MsgType.PING, b"")])
-        self.assertEqual(self.link.frames, [(ipc.MsgType.PING, b"")])
+        payload = hid.encode_keyboard(0x02, (0x04,))       # left shift + 'a'
+        self.sink.apply([model.SendFrame(hid.KEYBOARD, payload)])
+        self.assertEqual(self.link.frames, [(hid.KEYBOARD, payload)])
         self.assertEqual(self.sink.sent_frames, 1)
         self.assertEqual(self.sink.failed_frames, 0)
 
     def test_failed_send_counted(self) -> None:
         link = FakeLink(accept=False)
         sink = output.EffectSink(link, self.engine)
-        sink.apply([model.SendFrame(ipc.MsgType.PING, b"")])
+        sink.apply([model.SendFrame(hid.RELEASE_ALL, b"")])
         self.assertEqual(sink.failed_frames, 1)
 
     def test_clip_and_release_toggle_engine(self) -> None:

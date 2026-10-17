@@ -1,7 +1,8 @@
 """Service orchestration: wires the input, process and output stages together.
 
-Responsibilities are limited to lifecycle and data flow. All routing rules
-live in :mod:`winborder.model` and all device I/O lives in :mod:`winborder.link`.
+Responsibilities are limited to lifecycle and data flow. All routing rules live
+in :mod:`winborder.model` and the peripheral itself lives in
+:mod:`winborder.ble`.
 """
 
 from __future__ import annotations
@@ -10,9 +11,9 @@ import logging
 import threading
 import time
 
-from . import ipc, model, win32
+from . import model, win32
+from .ble import BleFrameSink, BleHidPeripheral
 from .input import InputEngine
-from .link import LinkError, SerialLink
 from .output import EffectSink
 
 log = logging.getLogger("winborder.service")
@@ -20,6 +21,20 @@ log = logging.getLogger("winborder.service")
 TICK_INTERVAL_S = 1.0 / 250.0
 SCREEN_REFRESH_TICKS = 250
 RECONNECT_INTERVAL_S = 2.0
+
+
+def _refusal_explained(reason: str) -> str:
+    """Turn a router refusal reason into something the user can act on.
+
+    The refusal is logged, not shown modally, so it has to carry the next step
+    with it: "device link is not open" says nothing to someone who expects the
+    cursor to cross.
+    """
+    if reason == "device link is not open":
+        return ("not handing over yet: no target is connected. Pair this PC from "
+                "the target's own Bluetooth settings; the name in that list is "
+                "this computer's Bluetooth name")
+    return "not handing over yet: " + reason
 
 
 def _unit(value: float) -> float:
@@ -30,11 +45,13 @@ def _unit(value: float) -> float:
 class Service:
     """Runs the bridge until stopped."""
 
-    def __init__(self, port: str, config: model.Config | None = None,
-                 baudrate: int = ipc.DEFAULT_BAUDRATE) -> None:
+    def __init__(self, config: model.Config | None = None) -> None:
         self.cfg = config or model.Config()
-        self.port = port
-        self.baudrate = baudrate
+
+        # The name a target lists, which Windows keeps apart from the computer
+        # name. Read once: it is what the target has to look for, so both the log
+        # and the Devices page have to name the same thing.
+        self.device_name = win32.bluetooth_name()
 
         self.engine = InputEngine()
         self.router = model.Router(
@@ -42,14 +59,17 @@ class Service:
             screen=self._screen_size(),
             handoff_allowed=self._handoff_allowed,
         )
-        self._link: SerialLink | None = None
+        self._link: BleFrameSink | None = None
         self._sink: EffectSink | None = None
         self._stop = threading.Event()
         self._ticks = 0
         self._last_written = 0
         self._link_failed = False
         self._pause_wanted = False
+        self._refused_reason: str | None = None
+        self._target_listening = False
         self._cursor: tuple[int, int] = (0, 0)
+
     # -- wiring -----------------------------------------------------------
 
     def _screen_size(self) -> tuple[int, int]:
@@ -76,7 +96,7 @@ class Service:
     def run(self) -> None:
         """Blocking main loop."""
         self.start()
-        log.info("bridge running, target side=%s", self.cfg.side.value)
+        log.debug("bridge running, target side=%s", self.cfg.side.value)
         try:
             while not self._stop.is_set():
                 self._step()
@@ -128,6 +148,13 @@ class Service:
             "written": link.written_frames if link else 0,
             "bad": link.bad_frames if link else 0,
             "connected": bool(link and link.is_open),
+            # Whether anything is on the air at all, and under what name. The
+            # window shows both on the Devices page, where "nothing is
+            # advertising" and "which entry is this PC" are the two questions a
+            # target that will not connect leaves behind.
+            "advertising": (link.peripheral.advertising_status if link
+                            else "not started"),
+            "name": self.device_name,
         }
 
     def _cursor_fraction(self) -> tuple[float, float]:
@@ -153,29 +180,72 @@ class Service:
     # -- link management --------------------------------------------------
 
     def _connect(self) -> None:
-        try:
-            self._link = SerialLink(self.port, self.baudrate)
-        except LinkError as exc:
-            if not self._link_failed:
-                log.warning("link unavailable on %s: %s", self.port, exc)
-                self._link_failed = True
-            self._link = None
+        """Publish the PC as the BLE peripheral.
+
+        The peripheral starts advertising immediately, but it is not usable until
+        a target subscribes, and is_open reflects exactly that. Nothing here
+        triggers pairing: Windows cannot initiate it as a peripheral, so the user
+        pairs from the target's own Bluetooth settings.
+        """
+        if self._link is not None:
             return
+        try:
+            peripheral = BleHidPeripheral(on_event=self._on_ble_event)
+            peripheral.start()
+        except Exception as exc:
+            if not self._link_failed:
+                log.warning("BLE peripheral unavailable: %s", exc)
+                self._link_failed = True
+            return
+
         if self._link_failed:
-            log.info("link restored on %s", self.port)
+            log.info("BLE peripheral advertising again")
+        self._link = BleFrameSink(peripheral)
         self._link_failed = False
-        self._sink = EffectSink(_LinkAdapter(self._link), self.engine)
+        self._sink = EffectSink(self._link, self.engine)
         self._sink.apply(self.router.reset_device_state())
+        # Windows does not let an application set the advertised name, so say
+        # which one to look for. That name is the Bluetooth name of this PC, not
+        # its computer name, and only the radio itself knows it.
+        log.info("advertising as %r; pair it from the target's own Bluetooth "
+                 "settings", self.device_name or "this PC")
+
+    def _on_ble_event(self, kind: str, text: str) -> None:
+        if kind in ("subscribed", "unsubscribed"):
+            # The target subscribes to three reports in a row, so the raw events
+            # are three lines about one connection. What matters is the moment it
+            # starts listening and the moment it stops, and the link itself knows
+            # which of the two it is in: the count does not have to be read out of
+            # the text.
+            listening = self._link is not None and self._link.is_open
+            if listening != self._target_listening:
+                self._target_listening = listening
+                log.info("the target is connected and listening" if listening
+                         else "the target is gone; waiting for it to come back")
+            else:
+                log.debug("ble %s: %s", kind, text)
+            if kind == "subscribed":
+                # A fresh subscription is the one event that makes the refusal
+                # notice worth saying again if the link is lost later.
+                self._refused_reason = None
+            return
+        if kind == "started":
+            # The one state that means the PC is on the air, in the words the
+            # rule below gives: the service says it, the peripheral only details.
+            log.info("%s", text)
+            return
+        # Everything else is for whoever is debugging: a read, an advertisement
+        # restarting, a report the target wrote back.
+        log.debug("ble %s: %s", kind, text)
 
     def _ensure_link(self) -> None:
         if self._link is not None and self._link.is_open:
             return
         if self._link is not None:
-            log.warning("link lost on %s, reconnecting", self.port)
-            if self._sink is not None:
-                self._sink.apply(
-                    self.router.leave_target("link_lost", time.monotonic()))
-            self._link = None
+            # Advertising without a subscriber is normal while waiting for the
+            # target, so the peripheral is kept up rather than restarted: a
+            # restart changes its address and invalidates a bond the target made.
+            return
         self._connect()
 
     # -- main step --------------------------------------------------------
@@ -197,14 +267,12 @@ class Service:
             time.sleep(RECONNECT_INTERVAL_S)
             return
 
-        # Link health is judged by frames the writer thread actually put on the
-        # wire, not by how many the router produced. Frames are queued, so a
-        # successful enqueue says nothing about delivery.
+        # Link health is judged by reports the peripheral actually delivered, not
+        # by how many the router produced: a report with no subscriber behind it
+        # is not a healthy link.
         if link.written_frames != self._last_written:
             self._last_written = link.written_frames
             self.router.note_link_ok(now)
-
-        self._drain_device_frames(link)
 
         raw_dx, raw_dy = self.engine.take_raw_delta()
         events: list[model.InputEvent] = []
@@ -232,58 +300,41 @@ class Service:
         if self._sink is not None:
             for note in self._sink.apply(effects):
                 self._on_note(note)
-        log.info("bridge %s", "paused" if self._pause_wanted else "resumed")
-
-    def _drain_device_frames(self, link: SerialLink) -> None:
-        for msg_type, payload in link.poll():
-            try:
-                if msg_type == ipc.DevMsgType.LOG:
-                    log.debug("device: %s", ipc.decode_log(payload))
-                elif msg_type == ipc.DevMsgType.VERSION:
-                    major, minor, patch = ipc.decode_version(payload)
-                    log.info("firmware %d.%d.%d", major, minor, patch)
-                elif msg_type == ipc.DevMsgType.NAK:
-                    _, reason = ipc.decode_nak(payload)
-                    log.warning("device rejected a frame: %s", reason)
-                elif msg_type == ipc.DevMsgType.SWITCH_BACK:
-                    reason = ipc.decode_switch_back(payload)
-                    self._sink.apply(
-                        self.router.leave_target(f"device:{reason}", time.monotonic()))
-            except ValueError as exc:
-                log.debug("malformed device frame: %s", exc)
+        log.info("the bridge is %s",
+                 "paused, the PC has the keyboard and mouse"
+                 if self._pause_wanted else "running again")
 
     def _on_note(self, note: str) -> None:
         pointer = self.router.pointer_report()
         if note == "enter_target":
-            log.info("enter target mode, pointer at %.1f%%, %.1f%%",
-                     self.router.pointer_x * 100, self.router.pointer_y * 100)
+            log.info("the target has the keyboard and mouse")
+            log.debug("enter target mode, pointer at %.1f%%, %.1f%%",
+                      self.router.pointer_x * 100, self.router.pointer_y * 100)
         elif note.startswith("leave_target"):
             reason = note.partition(":")[2]
             # These are the values the return rule decided on. They cannot say
             # where the target put its own pointer: the reports are relative and
             # the target scales them. The pointer trace is what shows whether
             # the two agree.
-            log.info("leave target mode (%s) at pointer %.1f%%, %.1f%% "
-                     "(travel %.1f%%)",
-                     reason, self.router.pointer_x * 100, self.router.pointer_y * 100,
-                     pointer["travel"] * 100)
+            # Said the way a user reads it; the numbers are what the return rule
+            # decided on, and they belong on the debug line under it. They cannot
+            # say where the target put its own pointer: the reports are relative
+            # and the target scales them.
+            log.info("the PC has the keyboard and mouse again")
+            log.debug("leave target mode (%s) at pointer %.1f%%, %.1f%% "
+                      "(travel %.1f%%)",
+                      reason, self.router.pointer_x * 100,
+                      self.router.pointer_y * 100, pointer["travel"] * 100)
         elif note.startswith("handoff_refused"):
-            log.error("input capture refused: %s", note.partition(":")[2])
+            reason = note.partition(":")[2]
+            # Pressing against the edge while the target is not connected is
+            # normal — it is what waiting for the target looks like — so say it
+            # once and then go quiet. Repeating it every attempt buries
+            # everything else in the log.
+            if reason != self._refused_reason:
+                self._refused_reason = reason
+                log.warning("%s", _refusal_explained(reason))
         elif note.startswith("paused"):
-            log.info("bridge paused by hand, the PC has the keyboard and mouse")
+            log.debug("bridge paused by hand, the PC has the keyboard and mouse")
         elif note.startswith("resumed"):
-            log.info("bridge resumed")
-
-
-class _LinkAdapter:
-    """Adapts SerialLink to the frame sink protocol."""
-
-    def __init__(self, link: SerialLink) -> None:
-        self._link = link
-
-    def send(self, msg_type: int, payload: bytes) -> bool:
-        try:
-            return self._link.submit(ipc.encode_frame(msg_type, payload))
-        except ValueError:
-            log.debug("dropped oversized frame type=0x%02X", msg_type)
-            return False
+            log.debug("bridge resumed")

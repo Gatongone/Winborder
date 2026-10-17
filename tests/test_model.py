@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import struct
 import unittest
 
-from winborder import ipc, keymap, model
+from winborder import hid, keymap, model
 
 SCREEN = (1920, 1080)
 VK_F1 = 0x70
@@ -202,7 +201,7 @@ class TestRatioMapping(unittest.TestCase):
                 router = make_router(side)
                 effects = router.enter_target(at_edge(side), 1000.0)
                 moved = [e for e in effects if isinstance(e, model.SendFrame)
-                         and e.msg_type is ipc.MsgType.MOUSE_MOVE]
+                         and e.kind == hid.MOUSE_MOVE]
                 self.assertEqual(moved, [])
                 self.assertEqual(router._crossing_travel(), 0.0)
 
@@ -224,9 +223,9 @@ class TestRatioMapping(unittest.TestCase):
                     steps += 1
                     effects = step(router, [model.MouseMove(*back_to_pc(side))],
                                    now, at_edge(side))
-                    sent += [struct.unpack_from("<hh", e.payload) for e in effects
+                    sent += [hid.decode_mouse_move(e.payload) for e in effects
                              if isinstance(e, model.SendFrame)
-                             and e.msg_type is ipc.MsgType.MOUSE_MOVE]
+                             and e.kind == hid.MOUSE_MOVE]
                     if router.mode is model.Mode.PC:
                         break
                 self.assertIs(router.mode, model.Mode.PC)
@@ -449,9 +448,9 @@ class TestTargetPointerIndependence(unittest.TestCase):
                 for effect in effects:
                     if not isinstance(effect, model.SendFrame):
                         continue
-                    if effect.msg_type is not ipc.MsgType.MOUSE_MOVE:
+                    if effect.kind != hid.MOUSE_MOVE:
                         continue
-                    dx, dy = struct.unpack_from("<hh", effect.payload)
+                    dx, dy = hid.decode_mouse_move(effect.payload)
                     inward = dx * sign[0] + dy * sign[1]
                     real = min(self.SURFACE, max(0.0, real + gain * inward))
                 if router.mode is model.Mode.PC:
@@ -490,46 +489,115 @@ class TestKeyboard(unittest.TestCase):
 
     def states(self, effects: list[model.Effect]) -> list[bytes]:
         return [e.payload for e in effects
-                if isinstance(e, model.SendFrame) and e.msg_type == ipc.MsgType.STATE]
+                if isinstance(e, model.SendFrame) and e.kind == hid.KEYBOARD]
 
     def test_letter_produces_usage(self) -> None:
         effects = step(self.router, [model.KeyPress(0x41, True)], 1000.1,
                                    (SCREEN[0] - 1, 540))
-        self.assertEqual(self.states(effects)[-1][2], 0x04)
+        # The report is [modifiers][k0..k6]: the first key sits at index 1,
+        # because there is no reserved byte in front of the slots.
+        self.assertEqual(self.states(effects)[-1][1], 0x04)
 
     def test_key_release_clears_slot(self) -> None:
         step(self.router, [model.KeyPress(0x41, True)], 1000.1,
                          (SCREEN[0] - 1, 540))
         effects = step(self.router, [model.KeyPress(0x41, False)], 1000.2,
                                    (SCREEN[0] - 1, 540))
-        self.assertEqual(self.states(effects)[-1][2:], b"\x00" * 6)
+        self.assertEqual(self.states(effects)[-1][1:], b"\x00" * hid.KEY_SLOTS)
 
     def test_modifier_sets_bit_not_slot(self) -> None:
         effects = step(self.router, [model.KeyPress(0xA2, True)], 1000.1,
                                    (SCREEN[0] - 1, 540))
         state = self.states(effects)[-1]
         self.assertEqual(state[0], keymap.MOD_LEFT_CTRL)
-        self.assertEqual(state[2:], b"\x00" * 6)
+        self.assertEqual(state[1:], b"\x00" * hid.KEY_SLOTS)
 
-    def test_six_key_limit(self) -> None:
-        for vk in range(0x41, 0x48):
+    def test_every_report_matches_the_map(self) -> None:
+        """The payloads must be exactly as long as the report map declares.
+
+        A report whose length disagrees with its descriptor is discarded by the
+        host with no error anywhere, which presents as a target that connects,
+        subscribes, and then types nothing. That is the fault that cost the most
+        time in this project, so the map is parsed here rather than trusted.
+        """
+        from winborder import ble
+
+        declared = _declared_report_bytes(ble.HID_REPORT_MAP)
+        self.assertEqual(
+            {report_id: declared[report_id] for report_id in sorted(declared)},
+            {1: hid.KEYBOARD_PAYLOAD, 2: hid.MOUSE_REPORT, 3: hid.CONSUMER_PAYLOAD},
+        )
+
+        # And the encoders agree with the map, one report each. A movement
+        # payload covers the two deltas only; the report adds the buttons and
+        # both wheel axes around them.
+        self.assertEqual(len(hid.encode_keyboard(0, ())), declared[1])
+        self.assertEqual(len(hid.encode_mouse_move(1, 2)), hid.MOUSE_MOVE_PAYLOAD)
+        self.assertEqual(declared[2], 1 + hid.MOUSE_MOVE_PAYLOAD)
+        self.assertEqual(len(hid.encode_mouse_button(1)), 1)
+        self.assertEqual(len(hid.encode_wheel(1)), 2)
+        self.assertEqual(len(hid.encode_consumer(0xE9)), declared[3])
+
+    def test_the_mouse_report_carries_a_pan_axis(self) -> None:
+        # Both wheel settings feed the same report, and a horizontal detent has
+        # nowhere to go unless the map declares a pan axis beside the wheel. The
+        # bytes are Usage Page (Consumer) then Usage (AC Pan).
+        from winborder import ble
+
+        self.assertIn(bytes([0x05, 0x0C, 0x0A, 0x38, 0x02]), ble.HID_REPORT_MAP)
+
+    def test_every_named_key_is_inside_what_the_map_declares(self) -> None:
+        """A key outside the map's usage range can be named and never sent.
+
+        The array's Usage Maximum is the ceiling for every key slot: F13 to F24
+        are 0x68 to 0x73, so a map that stopped at 0x65 dropped them in silence.
+        """
+        from winborder import ble, keymap
+
+        ceiling = _key_array_usage_max(ble.HID_REPORT_MAP)
+        too_high = sorted(
+            name for name, (_vk, usage) in keymap.KEY_NAMES.items()
+            if not keymap._is_modifier(usage) and usage > ceiling)
+        self.assertEqual(too_high, [],
+                         f"the keyboard report declares usages up to {ceiling:#04x}")
+
+    def test_the_keyboard_uses_every_slot_the_map_declares(self) -> None:
+        """The router's rollover cap is the map's slot count.
+
+        A short report is silently dropped; a cap below the slot count would
+        also quietly discard the seventh key a user is holding.
+        """
+        from winborder import ble
+
+        keyboard = _declared_report_bytes(ble.HID_REPORT_MAP)[1]
+        self.assertEqual(keyboard, 1 + hid.KEY_SLOTS)
+        state = hid.encode_keyboard(0, tuple(range(1, hid.KEY_SLOTS + 1)))
+        self.assertEqual(len(state), keyboard)
+        self.assertEqual(len(state) - 1, len(set(state[1:])))
+
+    def test_rollover_drops_the_oldest_key(self) -> None:
+        for vk in range(0x41, 0x41 + hid.KEY_SLOTS):
             step(self.router, [model.KeyPress(vk, True)], 1000.1,
                              (SCREEN[0] - 1, 540))
-        self.assertEqual(len(self.router.keyboard.keys), 6)
+        self.assertEqual(len(self.router.keyboard.keys), hid.KEY_SLOTS)
+        step(self.router, [model.KeyPress(0x5A, True)], 1000.2,
+                         (SCREEN[0] - 1, 540))
+        self.assertEqual(len(self.router.keyboard.keys), hid.KEY_SLOTS)
+        self.assertNotIn(0x41, self.router.keyboard.keys, "oldest key should go")
 
-    def test_consumer_key_uses_report_id_three(self) -> None:
+    def test_consumer_key_goes_out_as_a_consumer_report(self) -> None:
         effects = step(self.router, [model.KeyPress(0xAF, True)], 1000.1,
                                    (SCREEN[0] - 1, 540))
         consumer = [e.payload for e in effects
                     if isinstance(e, model.SendFrame)
-                    and e.msg_type == ipc.MsgType.CONSUMER]
+                    and e.kind == hid.CONSUMER]
         self.assertTrue(consumer)
         self.assertEqual(int.from_bytes(consumer[-1], "little"), 0xE8)
 
     def test_unmapped_key_is_ignored(self) -> None:
         effects = step(self.router, [model.KeyPress(0xFF, True)], 1000.1,
                                    (SCREEN[0] - 1, 540))
-        self.assertEqual(self.states(effects)[-1][2:], b"\x00" * 6)
+        self.assertEqual(self.states(effects)[-1][1:], b"\x00" * hid.KEY_SLOTS)
 
 
 class TestHotkeys(unittest.TestCase):
@@ -584,10 +652,8 @@ class TestMouseReports(unittest.TestCase):
     def moves(self, effects: list[model.Effect]) -> list[tuple[int, int]]:
         out = []
         for e in effects:
-            if isinstance(e, model.SendFrame) and e.msg_type == ipc.MsgType.MOUSE_MOVE:
-                dx = int.from_bytes(e.payload[0:2], "little", signed=True)
-                dy = int.from_bytes(e.payload[2:4], "little", signed=True)
-                out.append((dx, dy))
+            if isinstance(e, model.SendFrame) and e.kind == hid.MOUSE_MOVE:
+                out.append(hid.decode_mouse_move(e.payload))
         return out
 
     def test_large_move_is_chunked(self) -> None:
@@ -610,7 +676,7 @@ class TestMouseReports(unittest.TestCase):
                                    (SCREEN[0] - 1, 540))
         payloads = [e.payload for e in effects
                     if isinstance(e, model.SendFrame)
-                    and e.msg_type == ipc.MsgType.MOUSE_BUTTON]
+                    and e.kind == hid.MOUSE_BUTTON]
         self.assertEqual(payloads[-1], b"\x01")
 
     def test_wheel_direction_default_inverted(self) -> None:
@@ -618,9 +684,9 @@ class TestMouseReports(unittest.TestCase):
                                    (SCREEN[0] - 1, 540))
         effects += step(self.router, [model.MouseMove(1, 0)], 1000.6,
                                     (SCREEN[0] - 1, 540))
-        wheels = [e.payload for e in effects
+        wheels = [hid.decode_wheel(e.payload) for e in effects
                   if isinstance(e, model.SendFrame)
-                  and e.msg_type == ipc.MsgType.MOUSE_WHEEL]
+                  and e.kind == hid.MOUSE_WHEEL]
         self.assertTrue(wheels)
         self.assertGreater(wheels[0][0], 0)
 
@@ -630,10 +696,38 @@ class TestMouseReports(unittest.TestCase):
             [model.MouseMove(10, 10), model.MouseButton(0x01, True),
              model.MouseWheel(120), model.KeyPress(0x41, True)],
             1000.0, (960, 540))
-        forwarded = [e for e in effects
-                     if isinstance(e, model.SendFrame)
-                     and e.msg_type is not ipc.MsgType.PING]
+        forwarded = [e for e in effects if isinstance(e, model.SendFrame)]
         self.assertEqual(forwarded, [])
+
+    def test_a_held_key_is_never_released_to_keep_the_link_alive(self) -> None:
+        """A periodic release_all used to let go of whatever was held.
+
+        The reports it was meant to keep alive are already dropped by the
+        peripheral when nothing changed, so all it did was make a held key look
+        like it was repeating twice a second.
+        """
+        router = make_router()
+        step(router, [model.MouseMove(10, 0)], 1000.0, at_edge(model.Side.RIGHT))
+        self.assertIs(router.mode, model.Mode.TARGET)
+        step(router, [model.KeyPress(0x41, True)], 1000.1, at_edge(model.Side.RIGHT))
+
+        releases = 0
+        states: list[bytes] = []
+        for tick in range(40):                    # two seconds of holding still
+            # step() reports the link as healthy, as the service does: without it
+            # the silence rule would leave the target at 1.5 s and release by
+            # design, which is not what this test is about.
+            for effect in step(router, [], 1000.2 + tick * 0.05,
+                               at_edge(model.Side.RIGHT)):
+                if not isinstance(effect, model.SendFrame):
+                    continue
+                if effect.kind == hid.RELEASE_ALL:
+                    releases += 1
+                elif effect.kind == hid.KEYBOARD:
+                    states.append(effect.payload)
+        self.assertEqual(releases, 0, "a held key was released to keep the link alive")
+        self.assertTrue(states, "no keyboard state was sent while holding a key")
+        self.assertEqual(states[-1][1], 0x04, "the held key is no longer down")
 
 
 class TestNoChatter(unittest.TestCase):
@@ -666,6 +760,72 @@ class TestLinkLoss(unittest.TestCase):
         self.assertIs(router.mode, model.Mode.PC)
         self.assertEqual(router.stats.link_losses, 1)
 
+
+
+def _key_array_usage_max(report_map: bytes) -> int:
+    """The Usage Maximum the keyboard's key array declares.
+
+    The same walk as :func:`_declared_report_bytes`, but reading the Usage Maximum
+    item (prefix 0x2A for a two byte value) that caps the array's values.
+    """
+    highest = 0
+    index = 0
+    while index < len(report_map):
+        prefix = report_map[index]
+        index += 1
+        if prefix == 0xFE:
+            index += 2 + report_map[index]
+            continue
+        size = prefix & 0x03
+        if size == 3:
+            size = 4
+        tag = prefix & 0xFC
+        data = int.from_bytes(report_map[index:index + size], "little") if size else 0
+        index += size
+        if tag == 0x28:                          # Usage Maximum (Local item)
+            highest = max(highest, data)
+    return highest
+
+
+def _declared_report_bytes(report_map: bytes) -> dict[int, int]:
+    """Bytes each report id declares, read out of the descriptor itself.
+
+    A full USB HID parser is not needed: Report ID, Report Size and Report Count
+    are enough to total each input report, which is the budget a payload has to
+    match.
+    """
+    reports: dict[int, int] = {}
+    current_id = 0
+    report_size = 0
+    report_count = 0
+    bits = 0
+    index = 0
+    while index < len(report_map):
+        prefix = report_map[index]
+        index += 1
+        if prefix == 0xFE:                      # long item, unused here
+            index += 2 + report_map[index]
+            continue
+        size = prefix & 0x03
+        if size == 3:
+            size = 4
+        tag = prefix & 0xFC
+        data = int.from_bytes(report_map[index:index + size], "little") if size else 0
+        index += size
+
+        if tag == 0x84:                         # Report ID
+            current_id = data
+        elif tag == 0x74:                       # Report Size
+            report_size = data
+        elif tag == 0x94:                       # Report Count
+            report_count = data
+        elif tag == 0x80:                       # Input
+            bits += report_size * report_count
+        elif tag == 0xC0:                       # End Collection
+            if current_id and bits:
+                reports[current_id] = reports.get(current_id, 0) + bits
+            bits = 0
+    return {report_id: (total + 7) // 8 for report_id, total in reports.items()}
 
 class TestPause(unittest.TestCase):
     """The bridge can be held still without being stopped."""
@@ -701,8 +861,14 @@ class TestPause(unittest.TestCase):
                             for effect in router.set_paused(False, 1.0)))
 
     def test_asking_for_the_state_it_is_in_does_nothing(self) -> None:
+        """Once paused, asking again changes nothing.
+
+        The first request is reported, because that is what paused the bridge;
+        every request after it is a no-op.
+        """
         router = make_router()
-        self.assertEqual(router.set_paused(True, 0.0), [])
+        self.assertTrue(any(isinstance(effect, model.Notify)
+                            for effect in router.set_paused(True, 0.0)))
         self.assertEqual(router.set_paused(True, 1.0), [])
 
     def test_resuming_does_not_hand_over_at_once(self) -> None:

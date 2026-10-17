@@ -16,12 +16,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Sequence
 
-from . import ipc, keymap
+from . import hid, keymap
 
 PENDING_MOVE_CAP = 2000.0
 HID_STEP_LIMIT = 127
 LINK_SILENCE_TIMEOUT_S = 1.5
-PING_INTERVAL_S = 0.5
 REPORT_INTERVAL_S = 1.0 / 90.0
 
 # How long the bridge stays deaf to the screen edge after being resumed, so that
@@ -119,7 +118,14 @@ InputEvent = MouseMove | MouseButton | MouseWheel | KeyPress
 
 @dataclass(frozen=True)
 class SendFrame:
-    msg_type: int
+    """One report for the target.
+
+    ``kind`` is one of the report kinds in :mod:`winborder.hid` and ``payload``
+    is the report itself, encoded there. The router produces these; the output
+    stage hands them to whichever peripheral is connected.
+    """
+
+    kind: str
     payload: bytes
 
 
@@ -178,7 +184,10 @@ class _Keyboard:
     def key_down(self, usage: int) -> None:
         if usage in self.keys:
             return
-        if len(self.keys) >= 6:
+        # Rollover is capped at the slots the report actually carries, so the
+        # last slot is never dead padding. The oldest key is the one dropped:
+        # a key the user is still holding is never silently ignored.
+        if len(self.keys) >= hid.KEY_SLOTS:
             self.keys.pop(0)
         self.keys.append(usage)
 
@@ -191,7 +200,7 @@ class _Keyboard:
         self.keys.clear()
 
     def snapshot(self) -> bytes:
-        return ipc.encode_state(self.modifiers, tuple(self.keys))
+        return hid.encode_keyboard(self.modifiers, tuple(self.keys))
 
 
 class Router:
@@ -226,7 +235,6 @@ class Router:
         self._ctrl_armed = False
         self._ctrl_tap = False
         self._last_report = 0.0
-        self._last_ping = 0.0
         self._reentry_until = 0.0
         self._inward_left = 0.0
         self._returning = False
@@ -354,10 +362,10 @@ class Router:
         self.consumer = 0
         self._pending_dx = self._pending_dy = 0.0
         return [
-            SendFrame(ipc.MsgType.STATE, self.keyboard.snapshot()),
-            SendFrame(ipc.MsgType.CONSUMER, ipc.encode_consumer(0)),
-            SendFrame(ipc.MsgType.MOUSE_BUTTON, ipc.encode_mouse_button(0)),
-            SendFrame(ipc.MsgType.RESET, b""),
+            SendFrame(hid.KEYBOARD, self.keyboard.snapshot()),
+            SendFrame(hid.CONSUMER, hid.encode_consumer(0)),
+            SendFrame(hid.MOUSE_BUTTON, hid.encode_mouse_button(0)),
+            SendFrame(hid.RELEASE_ALL, b""),
         ]
 
     def enter_target(self, cursor: tuple[int, int], now: float) -> list[Effect]:
@@ -385,7 +393,7 @@ class Router:
         return [
             ClipCursor(self.cfg.side),
             CaptureInput(keyboard=True, mouse=self.cfg.capture_mouse_buttons),
-            SendFrame(ipc.MsgType.RESET, b""),
+            SendFrame(hid.RELEASE_ALL, b""),
             Notify("enter_target"),
         ]
 
@@ -412,10 +420,10 @@ class Router:
             self._arm_reentry(distance, self.cfg.enter_cooldown, now)
 
         return [
-            SendFrame(ipc.MsgType.STATE, self.keyboard.snapshot()),
-            SendFrame(ipc.MsgType.CONSUMER, ipc.encode_consumer(0)),
-            SendFrame(ipc.MsgType.MOUSE_BUTTON, ipc.encode_mouse_button(0)),
-            SendFrame(ipc.MsgType.RESET, b""),
+            SendFrame(hid.KEYBOARD, self.keyboard.snapshot()),
+            SendFrame(hid.CONSUMER, hid.encode_consumer(0)),
+            SendFrame(hid.MOUSE_BUTTON, hid.encode_mouse_button(0)),
+            SendFrame(hid.RELEASE_ALL, b""),
             ReleaseCursor(),
             CaptureInput(keyboard=False, mouse=False),
             PlaceCursor(x=target[0], y=target[1], move_inside=distance,
@@ -585,7 +593,7 @@ class Router:
         self.buttons = (self.buttons | event.mask) if event.down else (
             self.buttons & ~event.mask)
         out: list[Effect] = [
-            SendFrame(ipc.MsgType.MOUSE_BUTTON, ipc.encode_mouse_button(self.buttons))
+            SendFrame(hid.MOUSE_BUTTON, hid.encode_mouse_button(self.buttons))
         ]
         if event.down:
             out.append(Notify("target_click"))
@@ -678,10 +686,15 @@ class Router:
     # -- output framing ---------------------------------------------------
 
     def _maybe_report(self, now: float, force: bool = False) -> list[Effect]:
+        """The frames one step puts on the wire, and nothing else.
+
+        There used to be a periodic ``release_all`` here, meant as a keep alive.
+        It did not keep anything alive -- the peripheral drops a report that is
+        identical to the last one it sent, so an idle router was already silent --
+        and while a key was held it released that key and pressed it again twice a
+        second, which the target reads as the key repeating.
+        """
         out: list[Effect] = []
-        if now - self._last_ping >= PING_INTERVAL_S:
-            self._last_ping = now
-            out.append(SendFrame(ipc.MsgType.PING, b""))
         if self.mode is not Mode.TARGET:
             return out
         if not force and now - self._last_report < REPORT_INTERVAL_S:
@@ -698,7 +711,7 @@ class Router:
                 break
             self._pending_dx -= dx
             self._pending_dy -= dy
-            out.append(SendFrame(ipc.MsgType.MOUSE_MOVE, ipc.encode_mouse_move(dx, dy)))
+            out.append(SendFrame(hid.MOUSE_MOVE, hid.encode_mouse_move(dx, dy)))
             self.stats.frames += 1
 
         v_sign = -1 if self.cfg.invert_wheel_v else 1
@@ -706,21 +719,21 @@ class Router:
         if self._wheel_up >= 1.0:
             steps = int(self._wheel_up)
             self._wheel_up -= steps
-            out.append(SendFrame(ipc.MsgType.MOUSE_WHEEL,
-                                 ipc.encode_wheel(v_sign * steps * self.cfg.notch_up, 0)))
+            out.append(SendFrame(hid.MOUSE_WHEEL,
+                                 hid.encode_wheel(v_sign * steps * self.cfg.notch_up, 0)))
         if self._wheel_down <= -1.0:
             steps = int(-self._wheel_down)
             self._wheel_down += steps
-            out.append(SendFrame(ipc.MsgType.MOUSE_WHEEL,
-                                 ipc.encode_wheel(v_sign * -steps * self.cfg.notch_down, 0)))
+            out.append(SendFrame(hid.MOUSE_WHEEL,
+                                 hid.encode_wheel(v_sign * -steps * self.cfg.notch_down, 0)))
         if abs(self._wheel_h) >= 1.0:
             steps = int(_clamp(self._wheel_h, -HID_STEP_LIMIT, HID_STEP_LIMIT))
             self._wheel_h -= steps
-            out.append(SendFrame(ipc.MsgType.MOUSE_WHEEL,
-                                 ipc.encode_wheel(0, h_sign * steps)))
+            out.append(SendFrame(hid.MOUSE_WHEEL,
+                                 hid.encode_wheel(0, h_sign * steps)))
 
-        out.append(SendFrame(ipc.MsgType.STATE, self.keyboard.snapshot()))
-        out.append(SendFrame(ipc.MsgType.CONSUMER, ipc.encode_consumer(self.consumer)))
+        out.append(SendFrame(hid.KEYBOARD, self.keyboard.snapshot()))
+        out.append(SendFrame(hid.CONSUMER, hid.encode_consumer(self.consumer)))
         self.stats.frames += len(out)
         return out
 
@@ -739,6 +752,6 @@ def _replace(cfg: Config, **changes: object) -> Config:
     return Config(**data)  # type: ignore[arg-type]
 
 
-def describe_effects(effects: Sequence[Effect]) -> str:
+
     """Compact rendering used by the debug build."""
     return ", ".join(type(e).__name__ for e in effects)

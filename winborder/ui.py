@@ -18,23 +18,33 @@ import os
 import queue
 import subprocess
 import threading
+import time
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
-from . import config, i18n, icon, keymap, model, startup, theme, trace
+from . import config, diagnostics, i18n, icon, keymap, model, startup, theme, \
+    trace
+# Project identity, kept in the package root beside the version it describes.
+from . import __author__, __license__, __repository__
 from .logbuffer import LogBuffer
 from .service import Service
 from pathlib import Path
+from .scan import DeviceScanner
 from .tray import TrayIcon
 from . import widgets
-from .widgets import Card, CheckBox, Icon, Row, Separator, Sidebar, \
-    ToggleSwitch
+from .widgets import Card, CheckBox, Icon, RemapList, Row, Separator, Sidebar, \
+    ThemedLabel, ToggleSwitch
 
 log = logging.getLogger("winborder.ui")
 
 POLL_MS = 200
+SCAN_POLL_MS = 1000
 THEME_POLL_MS = 2000
 COMMIT_DELAY_MS = 400
+# Windows reports the advertisement as aborted for the second or two it takes to
+# restart the advertiser, so a short abort is what every start looks like.
+ABORT_GRACE_S = 3.0
 
 
 class Field:
@@ -53,8 +63,6 @@ class Field:
 # The text is the English source: it is translated where it is shown, so the
 # window can be built again in another language without touching this table.
 FIELDS: tuple[Field, ...] = (
-    Field("port", "Serial port", "text", "Empty finds the board automatically"),
-    Field("baudrate", "Baud rate", "int", "115200 matches the firmware"),
     Field("side", "Target side", "choice",
           "Which side of the PC the target device sits on",
           tuple(side.value for side in model.Side)),
@@ -62,12 +70,14 @@ FIELDS: tuple[Field, ...] = (
           "1.0 moves the target pointer as far as the PC cursor"),
     Field("accel", "Speed gain", "float",
           "Extra pointer gain proportional to how fast the mouse moves"),
-    Field("pullback_distance", "Return pull", "int",
-          "Motion towards the PC that returns control. Raise it if a return "
-          "arrives while the target pointer still looks inside its screen"),
+    Field("pullback_distance", "Damping", "int",
+          "How far you have to pull back towards the PC before control returns. "
+          "Raise it if a return arrives while the target pointer still looks "
+          "inside its screen"),
     Field("invert_wheel_v", "Invert vertical scroll", "bool",
-          "Scroll up on the target means scroll up on the PC"),
-    Field("invert_wheel_h", "Invert horizontal scroll", "bool"),
+          "Vertical scrolling is reversed on the target"),
+    Field("invert_wheel_h", "Invert horizontal scroll", "bool",
+          "Horizontal scrolling is reversed on the target"),
     Field("notch_up", "Scroll step up", "int", "Lines per wheel detent"),
     Field("notch_down", "Scroll step down", "int", "Lines per wheel detent"),
     Field("edge_trigger_enabled", "Cross at the screen edge", "bool",
@@ -89,14 +99,16 @@ FIELDS: tuple[Field, ...] = (
     Field("capture_mouse_buttons", "Capture mouse buttons", "bool",
           "Clicks go to the target while it has control"),
     Field("start_with_windows", "Start with Windows", "bool",
-          "Starts the host, minimised to the notification area, when you sign in"),
+          "One value under HKCU Software\\Microsoft\\Windows\\CurrentVersion\\Run, "
+          "holding the command line; nothing else is written"),
     Field("start_hidden", "Start hidden", "bool",
           "Open with the notification area icon only, without this window"),
     Field("language", "Language", "choice",
           "The language of this window. Changes apply immediately",
           i18n.codes()),
     Field("remap", "Remap keys", "remap",
-          "One From=To per line, for example CapsLock=Escape. The PC is unaffected"),
+          "Click a field and press the key, or right-click it to pick from the "
+          "full list. The PC is unaffected"),
 )
 
 FIELDS_BY_NAME = {field.name: field for field in FIELDS}
@@ -125,6 +137,94 @@ def choice_value(field: Field, label: object) -> str | None:
     return None
 
 
+def wrap_path(path: str, limit: int) -> str:
+    """A path that fits its column, broken after a separator rather than inside a name.
+
+    Tk wraps a label at any character, so a long settings path came out as
+    ``…\\winborder.js`` over ``on`` -- a file name cut in half, which reads as two
+    strings rather than as one path. Breaking after the last separator that still
+    fits keeps the file name whole, and the label shows the folder above it.
+
+    When there is no separator to break on, the middle is replaced with an
+    ellipsis instead: something has to give, and half a name is worse than a gap.
+    """
+    if len(path) <= limit:
+        return path
+    cut = path.rfind("\\", 0, limit)
+    if cut <= 0:
+        return shorten_path(path, limit)
+    head, tail = path[:cut + 1], path[cut + 1:]
+    if len(tail) > limit:
+        tail = shorten_path(tail, limit)
+    return head + "\n" + tail
+
+
+def shorten_path(path: str, limit: int) -> str:
+    """A path cut in the middle, keeping both ends distinguishable."""
+    if len(path) <= limit:
+        return path
+    if limit <= 3:
+        return path[:max(0, limit)]
+    keep = limit - 1
+    head = max(1, keep // 2)
+    tail = max(1, keep - head)
+    return path[:head] + "…" + path[-tail:]
+
+
+def link_summary(state: dict[str, object] | None, *,
+                 since: float | None = None,
+                 last_up: float | None = None,
+                 aborted_for: float = 0.0) -> str:
+    """What this PC's own Bluetooth link is doing, in one line.
+
+    This PC is the HID device, so the only connection it can have is one a host
+    opened: "connected" here means a host subscribed to the reports, and the
+    pairing itself can only be started from that host. The line is worded so
+    that it does not invite the reader to look for a connect button that could
+    not work.
+
+    ``since`` and ``last_up`` are wall clock times: when the subscription that is
+    open now began, and when the previous one ended. Which of them applies is
+    decided by the caller, which is the part that can see the transitions.
+
+    ``aborted_for`` is how long the stack has been reporting the advertisement as
+    aborted. Windows says that for the second or two it takes to restart the
+    advertiser after the peripheral starts, so short is normal and only a lasting
+    one is worth calling a fault.
+    """
+    def clock(when: float) -> str:
+        return time.strftime("%H:%M:%S", time.localtime(when))
+
+    if state is None:
+        return i18n.t("not advertising yet — the Log says why")
+
+    advertising = str(state.get("advertising") or "")
+    if state.get("connected"):
+        # A live subscription outranks the advertisement status: the status goes
+        # ABORTED and back again while a host is connected, and reporting that
+        # as a fault would be wrong at the one moment things are working.
+        when = since if since is not None else time.time()
+        return i18n.t("connected since {time} — the target device is subscribed").format(
+            time=clock(when))
+
+    if "aborted" in advertising and aborted_for >= ABORT_GRACE_S:
+        line = i18n.t("the advertisement was cut short — see the Log")
+    elif not advertising.startswith("start"):
+        line = i18n.t("not advertising yet — the Log says why")
+    else:
+        name = str(state.get("name") or "")
+        # Only ever the name the radio reports: the computer name is a different
+        # name, and a line naming the wrong one sends the reader looking for it in
+        # the target's list and finding nothing.
+        line = (i18n.t("advertising as {name} — waiting for the target device to pair").format(name=name)
+                if name else
+                i18n.t("advertising as a keyboard and mouse — waiting for the target device to pair"))
+    if last_up is not None:
+        line += "  ·  " + i18n.t("last connected at {time}").format(
+            time=clock(last_up))
+    return line
+
+
 # page key, title, icon, description, groups of rows
 PAGES: tuple[tuple[str, str, str, str,
                   tuple[tuple[str, tuple[tuple[str, ...], ...]], ...]], ...] = (
@@ -133,24 +233,27 @@ PAGES: tuple[tuple[str, str, str, str,
      "Startup, maintenance and what is running",
      (("Startup", (("start_with_windows",), ("start_hidden",))),
       ("Interface", (("language",),)))),
-    ("bridge", "Bridge", "link",
-     "The serial link to the board and where the target sits",
-     (("Connection", (("port", "baudrate"), ("side",))),)),
+    # The page is named for the screen edge the pointer crosses; the code still
+    # calls the act a handoff (the service refuses one, the router hands over), and
+    # the entry event is logged as one. Both halves meet here: where the target
+    # sits, where the keyboard and mouse leave the PC, and how they come back.
+    ("edge", "Edge", "edge",
+     "Where the target sits, and where the keyboard and mouse change hands",
+     (("Connection", (("side",),)),
+      ("Crossing", (("edge_inset", "enter_cooldown"), ("exit_clear_distance",))),
+      ("Returning", (("pullback_distance",), ("pullback_exit",))))),
+    ("nearby", "Devices", "bluetooth",
+     "What this PC can see over Bluetooth LE", ()),
     ("pointer", "Pointer", "pointer", "How mouse movement reaches the target",
      (("Movement", (("sensitivity", "accel"),)),
-      ("Returning", (("pullback_distance",), ("pullback_exit",))),
       ("Scrolling", (("notch_up", "notch_down"),
                      ("invert_wheel_v", "invert_wheel_h"))))),
-    ("edge", "Edge crossing", "edge",
-     "Handing the keyboard and mouse over at the screen edge",
-     (("Crossing", (("edge_inset", "enter_cooldown"),
-                    ("exit_clear_distance",))),)),
     ("keyboard", "Keyboard", "keyboard",
-     "Keys the host keeps for itself, and what the target receives",
-     (("Host keys", (("panic_keys",), ("toggle_edge_keys",))),
+     "Keys the PC keeps for itself, and what the target receives",
+     (("PC keys", (("panic_keys",), ("toggle_edge_keys",))),
       ("Target keyboard", (("capture_mouse_buttons", "forward_consumer_keys"),
                            ("remap",))))),
-    ("log", "Log", "log", "Everything the host and the board report", ()),
+    ("log", "Log", "terminal", "Everything Winborder reports", ()),
 )
 
 # The master switch shown in a page header, where the page has one.
@@ -161,11 +264,10 @@ PAGE_SWITCHES = {"edge": "edge_trigger_enabled"}
 # wider value column than a settings row: the link line names three counters.
 STATUS_ROWS: tuple[tuple[str, str, str], ...] = (
     ("mode", "Mode", "Which side has the keyboard and mouse"),
-    ("cursor", "PC cursor", "fraction of the PC screen"),
-    ("pointer", "Target pointer", "fraction of the tracked surface"),
-    ("travel", "Travel", "motion since the target was entered, negative on "
-                         "the way back"),
-    ("link", "Device link", "frames the board acknowledged"),
+    ("cursor", "PC cursor", "Fraction of the PC screen"),
+    ("pointer", "Target pointer", "Fraction of the tracked surface"),
+    ("travel", "Travel", "Motion since the target was entered, negative on the way back"),
+    ("link", "Device link", "Reports the target accepted"),
 )
 STATUS_CONTROL_WIDTH = 300
 
@@ -173,11 +275,86 @@ STATUS_CONTROL_WIDTH = 300
 # is a full path, so these rows carry a wider value column than the controls of
 # a settings card do.
 ABOUT_ROWS: tuple[tuple[str, str, str], ...] = (
-    ("version", "Version", "the host and this window"),
-    ("runtime", "Running from", "an executable, or Python"),
-    ("settings", "Settings file", "the file this window writes"),
+    ("version", "Version", "Shared by the window and the background service"),
+    ("runtime", "Running from", "An executable, or Python"),
+    ("developer", "Developer", "Author of Winborder"),
+    ("repository", "Repository", "Source code and releases"),
+    ("license", "License", "Terms for use and redistribution"),
+    ("settings", "Settings file",
+     "The file on disk that holds the current configuration"),
 )
 ABOUT_CONTROL_WIDTH = 360
+
+
+class Control:
+    """One editable control, read and written without knowing what it is.
+
+    A field's control used to be reached through whatever it happened to be: a
+    ``BooleanVar`` needed a branch, a dropdown needed the label behind its value,
+    and the remap list needed a special case in both directions. Each control now
+    answers ``read`` and ``write`` in the form's own terms -- the code behind a
+    label, a list of pairs, a bool -- so filling and reading are one loop each.
+    """
+
+    def read(self) -> object:
+        raise NotImplementedError
+
+    def write(self, value: object) -> None:
+        raise NotImplementedError
+
+
+class _VariableControl(Control):
+    """A control backed by a Tk variable, holding what the form holds."""
+
+    def __init__(self, variable: tk.Variable) -> None:
+        self._variable = variable
+
+    def read(self) -> object:
+        return self._variable.get()
+
+    def write(self, value: object) -> None:
+        self._variable.set(str(value))
+
+
+class _BoolControl(Control):
+    def __init__(self, variable: tk.BooleanVar) -> None:
+        self._variable = variable
+
+    def read(self) -> object:
+        return bool(self._variable.get())
+
+    def write(self, value: object) -> None:
+        self._variable.set(bool(value))
+
+
+class _ChoiceControl(Control):
+    """A dropdown shows a label; the form holds the value the label stands for."""
+
+    def __init__(self, field: Field, variable: tk.StringVar) -> None:
+        self._field = field
+        self._variable = variable
+
+    def read(self) -> object:
+        return choice_value(self._field, self._variable.get())
+
+    def write(self, value: object) -> None:
+        labels = choice_labels(self._field)
+        raw = str(value)
+        self._variable.set(labels[self._field.choices.index(raw)]
+                           if raw in self._field.choices else "")
+
+
+class _RemapControl(Control):
+    """The remap list is its own widget, so it is its own adapter."""
+
+    def __init__(self, widget: "RemapList") -> None:
+        self._widget = widget
+
+    def read(self) -> object:
+        return self._widget.pairs()
+
+    def write(self, value: object) -> None:
+        self._widget.set_pairs(value if isinstance(value, list) else [])
 
 
 class SettingsForm:
@@ -199,7 +376,7 @@ class SettingsForm:
                 self.values[field.name] = ", ".join(names)
             elif field.kind == "remap":
                 pairs = value if isinstance(value, dict) else {}
-                self.values[field.name] = "\n".join(f"{a}={b}" for a, b in pairs.items())
+                self.values[field.name] = [(str(a), str(b)) for a, b in pairs.items()]
             elif value is None:
                 self.values[field.name] = ""
             else:
@@ -233,16 +410,12 @@ class SettingsForm:
                 out[field.name] = names
             elif field.kind == "remap":
                 pairs: dict[str, str] = {}
-                for line in str(raw).splitlines():
-                    entry = line.strip()
-                    if not entry:
-                        continue
-                    source, _, target = entry.partition("=")
-                    source, target = source.strip(), target.strip()
+                for entry in raw or ():
+                    source, target = (str(part).strip() for part in entry)
                     if not source or not target:
                         raise config.ConfigError(
-                            i18n.t("{label}: expected From=To, got {entry}").format(
-                                label=label, entry=entry))
+                            i18n.t("{label}: every row needs a key on both sides").format(
+                                label=label))
                     for name in (source, target):
                         if name not in keymap.KEY_NAMES:
                             raise config.ConfigError(
@@ -270,6 +443,7 @@ class SettingsWindow:
         self.watcher = theme.ThemeWatcher(self.palette)
 
         self._variables: dict[str, tk.Variable] = {}
+        self._controls: dict[str, Control] = {}
         self._page_canvas: dict[str, tk.Canvas] = {}
         self._page_body: dict[str, tk.Frame] = {}
         self._page_scroll: dict[str, ttk.Scrollbar] = {}
@@ -284,6 +458,15 @@ class SettingsWindow:
         self._message_job: str | None = None
         self._caption_jobs: list[str] = []
         self._loading = False
+        # The scan is started from its page and stopped when the window goes,
+        # so it is created here rather than in the page builder.
+        self._scanner = DeviceScanner()
+        # When this PC's own link came up and went down, for the Devices page.
+        # Only the window can see the moment a host arrives, so it keeps them.
+        self._link_up = False
+        self._link_since: float | None = None
+        self._link_ended: float | None = None
+        self._abort_since: float | None = None
         # WINBORDER_PAGE opens a page directly, which is how the layout is looked
         # at without clicking through the sidebar.
         self._current_page = os.environ.get("WINBORDER_PAGE", "").strip()
@@ -358,9 +541,8 @@ class SettingsWindow:
         self.pages: dict[str, tk.Frame] = {}
         for key, title, icon, text, groups in PAGES:
             self.pages[key] = self._page(key, title, icon, text, groups)
-        self.message = tk.Label(self.content, text="", font=theme.UI_FONT_SMALL,
-                                anchor="w", background=palette.bg,
-                                foreground=palette.muted)
+        self.message = ThemedLabel(self.content, palette, "", tone="muted",
+                                   font=theme.UI_FONT_SMALL)
         self.message.grid(row=1, column=0, sticky="ew", padx=self.px(26),
                           pady=(0, self.px(8)))
 
@@ -377,6 +559,7 @@ class SettingsWindow:
         self.content.destroy()
         self._paintable = []
         self._variables = {}
+        self._controls = {}
         self._page_canvas = {}
         self._page_body = {}
         self._page_scroll = {}
@@ -407,6 +590,10 @@ class SettingsWindow:
             body = tk.Frame(page, background=palette.bg)
             body.grid(row=0, column=0, sticky="nsew")
             body.columnconfigure(0, weight=1)
+        elif key == "nearby":
+            body = tk.Frame(page, background=palette.bg)
+            body.grid(row=0, column=0, sticky="nsew")
+            body.columnconfigure(0, weight=1)
         else:
             body = self._scrolling(page, key)
 
@@ -418,15 +605,13 @@ class SettingsWindow:
         Icon(inner, icon, palette, size=32, background=palette.surface).grid(
             row=0, column=0, rowspan=2, padx=(self.px(18), self.px(16)),
             pady=self.px(18))
-        hero_title = tk.Label(inner, text=i18n.t(title), font=theme.HERO_FONT,
-                              anchor="w", background=palette.surface,
-                              foreground=palette.fg)
+        hero_title = ThemedLabel(inner, palette, i18n.t(title), on="surface",
+                                 font=theme.HERO_FONT)
         hero_title.grid(row=0, column=1, columnspan=2, sticky="w",
                         pady=(self.px(18), 0))
-        hero_text = tk.Label(inner, text=i18n.t(text), font=theme.UI_FONT,
-                             anchor="w", justify="left",
-                             wraplength=self.px(620),
-                             background=palette.surface, foreground=palette.muted)
+        hero_text = ThemedLabel(inner, palette, i18n.t(text), on="surface",
+                                tone="muted", font=theme.UI_FONT,
+                                wraplength=self.px(620))
         hero_text.grid(row=1, column=1, columnspan=2, sticky="w",
                        pady=(self.px(2), self.px(18)))
         self._paintable.extend([hero, hero_title, hero_text])
@@ -435,6 +620,7 @@ class SettingsWindow:
         if switch_name is not None:
             variable = tk.BooleanVar()
             self._variables[switch_name] = variable
+            self._controls[switch_name] = _BoolControl(variable)
             switch = ToggleSwitch(inner, variable, palette,
                                   command=lambda: self._changed(switch_name),
                                   background=palette.surface)
@@ -446,6 +632,8 @@ class SettingsWindow:
             self._status_page(body)
         elif key == "log":
             self._log_page(body)
+        elif key == "nearby":
+            self._nearby_page(body)
         elif key == "generic":
             self._groups(body, groups)
             self._about_page(body)
@@ -512,9 +700,8 @@ class SettingsWindow:
                 groups: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...]) -> None:
         palette = self.palette
         for title, rows in groups:
-            label = tk.Label(body, text=i18n.t(title), font=theme.SECTION_FONT,
-                             anchor="w", background=palette.bg,
-                             foreground=palette.muted)
+            label = ThemedLabel(body, palette, i18n.t(title), tone="muted",
+                                font=theme.SECTION_FONT)
             label.grid(row=self._next_row(body), column=0, sticky="w",
                        padx=self.px(26), pady=(self.px(18), self.px(6)))
             card = Card(body, palette)
@@ -531,6 +718,9 @@ class SettingsWindow:
                     separator.grid(row=index * 2 - 1, column=0, sticky="ew")
                     self._paintable.append(separator)
                 field = FIELDS_BY_NAME[name]
+                if field.kind == "remap":
+                    self._remap_block(card.inner, index, field)
+                    continue
                 row = Row(card.inner, palette, i18n.t(field.label),
                           i18n.t(field.hint),
                           make_control=lambda parent, name=name:
@@ -538,12 +728,48 @@ class SettingsWindow:
                 row.grid(row=index * 2, column=0, sticky="ew")
                 self._paintable.append(row)
 
+    def _remap_block(self, card: tk.Frame, index: int, field: Field) -> None:
+        """The remap list takes the width of the card, not the width of a control.
+
+        It is a list rather than a single value, so it reads across the card. The
+        way to add a line is the one thing on this row that belongs in the control
+        column, where every other row keeps its control: a plus at the right, on
+        the line with the description.
+        """
+        block = tk.Frame(card, background=self.palette.surface)
+        block.grid(row=index * 2, column=0, sticky="ew")
+        block.columnconfigure(0, weight=1)
+        self.remap_list = RemapList(block, self.palette,
+                                    on_change=lambda: self._changed("remap"))
+        self._controls["remap"] = _RemapControl(self.remap_list)
+
+        def make_add(parent: tk.Widget) -> tk.Widget:
+            # A drawn plus with no frame, rather than the word "Add" on a button:
+            # the row is already described by its title, and the action is one
+            # shape. It sits in the control column, on the description's line.
+            self.remap_add = widgets.IconButton(parent, "plus", self.palette,
+                                                command=self._add_remap)
+            self._paintable.append(self.remap_add)
+            return self.remap_add
+
+        Row(block, self.palette, i18n.t(field.label), i18n.t(field.hint),
+            make_control=make_add).grid(row=0, column=0, sticky="ew")
+        self.remap_list.grid(row=1, column=0, sticky="ew",
+                             padx=(self.px(14), self.px(16)),
+                             pady=(self.px(8), self.px(14)))
+        self._paintable.extend([block, self.remap_list])
+
+    def _add_remap(self) -> None:
+        """Add an empty line, ready to be filled in."""
+        self.remap_list.add_row()
+
     def _control(self, parent: tk.Widget, name: str) -> tk.Widget:
         palette = self.palette
         field = FIELDS_BY_NAME[name]
         if field.kind == "bool":
             variable = self._variables.get(name) or tk.BooleanVar()
             self._variables[name] = variable
+            self._controls[name] = _BoolControl(variable)
             return ToggleSwitch(parent, variable, palette,
                                 command=lambda: self._changed(name),
                                 background=palette.surface)
@@ -553,12 +779,13 @@ class SettingsWindow:
             control: tk.Widget = ttk.Combobox(parent, textvariable=variable, width=11,
                                               values=list(choice_labels(field)),
                                               state="readonly")
-        elif field.kind == "remap":
-            control = ttk.Entry(parent, textvariable=variable, width=30)
+            self._controls[name] = _ChoiceControl(field, variable)
         elif field.kind in ("int", "float"):
             control = ttk.Entry(parent, textvariable=variable, width=12)
+            self._controls[name] = _VariableControl(variable)
         else:
             control = ttk.Entry(parent, textvariable=variable, width=20)
+            self._controls[name] = _VariableControl(variable)
         variable.trace_add("write", lambda *_: self._changed(name))
         control.bind("<Return>", lambda _event: self._commit())
         control.bind("<FocusOut>", lambda _event: self._commit())
@@ -579,9 +806,8 @@ class SettingsWindow:
                 separator.grid(row=index * 2 - 1, column=0, sticky="ew")
                 self._paintable.append(separator)
             def make_value(parent, key=key) -> tk.Label:
-                value = tk.Label(parent, text="", font=theme.MONO_FONT, anchor="e",
-                                 background=self.palette.surface,
-                                 foreground=self.palette.fg)
+                value = ThemedLabel(parent, self.palette, on="surface",
+                                    font=theme.MONO_FONT, anchor="e")
                 self.status_rows[key] = value
                 self._paintable.append(value)
                 return value
@@ -594,9 +820,8 @@ class SettingsWindow:
     def _about_page(self, body: tk.Frame) -> None:
         """Where things live, and what is running."""
         palette = self.palette
-        label = tk.Label(body, text=i18n.t("About"), font=theme.SECTION_FONT,
-                         anchor="w", background=palette.bg,
-                         foreground=palette.muted)
+        label = ThemedLabel(body, palette, i18n.t("About"), tone="muted",
+                            font=theme.SECTION_FONT)
         label.grid(row=self._next_row(body), column=0, sticky="w",
                    padx=self.px(26), pady=(self.px(18), self.px(6)))
         card = Card(body, palette)
@@ -614,11 +839,18 @@ class SettingsWindow:
                 self._paintable.append(separator)
 
             def make_value(parent, key=key) -> tk.Label:
-                value = tk.Label(parent, text=facts.get(key, ""),
-                                 font=theme.MONO_FONT, anchor="e", justify="right",
-                                 wraplength=self.px(ABOUT_CONTROL_WIDTH - 10),
-                                 background=self.palette.surface,
-                                 foreground=self.palette.fg)
+                text = self._fit(facts.get(key, ""), ABOUT_CONTROL_WIDTH - 10)
+                value = ThemedLabel(parent, self.palette, text, on="surface",
+                                    font=theme.MONO_FONT, anchor="e",
+                                    justify="right",
+                                    wraplength=self.px(ABOUT_CONTROL_WIDTH - 10))
+                if key == "repository":
+                    # The one value here that is an address rather than a path, so
+                    # it is drawn as a link and opens in the browser.
+                    value.configure(cursor="hand2", font=self._link_font())
+                    value.set_tone("accent")
+                    value.bind("<Button-1>",
+                               lambda _event: self._open_url(__repository__))
                 self.about_rows[key] = value
                 self._paintable.append(value)
                 return value
@@ -641,8 +873,35 @@ class SettingsWindow:
         """What the About card shows on the right."""
         facts = startup.describe()
         facts["runtime"] = i18n.t(facts["runtime"])
+        facts["developer"] = __author__
+        facts["repository"] = __repository__
+        facts["license"] = __license__
         facts["settings"] = str(Path(self.config_path).resolve())
         return facts
+
+    def _link_font(self) -> tkfont.Font:
+        """The monospaced font with an underline, for the one address on the page.
+
+        Kept on the window rather than made on each rebuild: a named Tk font is
+        deleted with its object, and a label built with it would lose the underline.
+        """
+        font = getattr(self, "_underlined_mono", None)
+        if font is None:
+            font = tkfont.Font(root=self.root, font=theme.MONO_FONT, underline=1)
+            self._underlined_mono = font
+        return font
+
+    def _fit(self, text: str, width: float) -> str:
+        """Shorten a value until it fits the column, without wrapping mid-token.
+
+        Measured rather than guessed: the monospaced font gives one character
+        width to work with, and both that and the column follow the display
+        scale, so a character count worked out here would be wrong on a scaled
+        desktop.
+        """
+        units = max(1, int(round(tkfont.Font(font=theme.MONO_FONT).measure("0"))))
+        limit = max(8, int(self.px(width)) // units)
+        return wrap_path(text, limit)
 
     def reset(self) -> None:
         """Put every setting back to its built in default."""
@@ -664,7 +923,9 @@ class SettingsWindow:
         card.grid(row=2, column=0, sticky="nsew", padx=self.px(26))
         card.inner.columnconfigure(0, weight=1)
         card.inner.rowconfigure(0, weight=1)
-        self.log_text = tk.Text(card.inner, wrap="char", height=16,
+        # width=1 keeps the widget from asking for its default 80 columns,
+        # which is wider than the page and pushes everything off the right edge.
+        self.log_text = tk.Text(card.inner, wrap="char", height=16, width=1,
                                 font=theme.MONO_FONT,
                                 state="disabled", padx=8, pady=6, borderwidth=0,
                                 highlightthickness=0)
@@ -684,23 +945,26 @@ class SettingsWindow:
         self.pause_button = ttk.Button(tools, text=self._pause_label(),
                                        command=self._toggle_pause)
         self.pause_button.pack(side="left")
+        ttk.Button(tools, text=i18n.t("Clear"), command=self._clear_log).pack(
+            side="left", padx=self.px(10))
+        # Auto-scroll is a view setting rather than an action, so it sits at the
+        # far end of the row, and the count of what arrived while the view was
+        # held sits beside it: both are about the view, not about the log.
         self.scroll_var = tk.BooleanVar(value=True)
         follow = tk.Frame(tools, background=palette.bg)
-        follow.pack(side="left", padx=(self.px(10), 0))
+        follow.pack(side="right")
         box = CheckBox(follow, self.scroll_var, palette, background=palette.bg)
         box.pack(side="left")
-        label = tk.Label(follow, text=i18n.t("Auto-scroll"), font=theme.UI_FONT,
-                         background=palette.bg,
-                         foreground=palette.fg, cursor="hand2")
+        label = ThemedLabel(follow, palette, i18n.t("Auto-scroll"),
+                            font=theme.UI_FONT)
+        label.configure(cursor="hand2")
         label.pack(side="left", padx=(self.px(8), 0))
         for widget in (box, label):
             widget.bind("<Button-1>", lambda _event: box._toggle())
         self._paintable.extend([follow, box, label])
-        ttk.Button(tools, text=i18n.t("Clear"), command=self._clear_log).pack(
-            side="left", padx=self.px(10))
-        self.waiting = tk.Label(tools, text="", font=theme.UI_FONT_SMALL,
-                                background=palette.bg, foreground=palette.muted)
-        self.waiting.pack(side="right")
+        self.waiting = ThemedLabel(tools, palette, tone="muted",
+                                   font=theme.UI_FONT_SMALL)
+        self.waiting.pack(side="right", padx=(0, self.px(12)))
         self._paintable.extend([card, tools, self.waiting])
 
     def _pause_label(self) -> str:
@@ -711,6 +975,147 @@ class SettingsWindow:
         self.pause_button.configure(text=self._pause_label())
         self._show_waiting()
 
+    # -- nearby devices ---------------------------------------------------
+
+    def _nearby_page(self, body: tk.Frame) -> None:
+        """This PC's own link, then the devices around this PC.
+
+        The devices are a list, and deliberately nothing more: it cannot connect
+        to anything. In Bluetooth LE a connection is opened by the central, and
+        in HID over GATT the central is the target — this PC is the HID device
+        and can only advertise. What the list is good for is checking that the
+        target is in range while the target refuses to connect.
+
+        The line above it is the part that can be acted on, and the one thing the
+        list cannot show, because this PC never appears in its own scan.
+        """
+        palette = self.palette
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(3, weight=1)
+
+        self.link_state = ThemedLabel(
+            body, palette, tone="muted", font=theme.SECTION_FONT,
+            wraplength=self.px(520))
+        self.link_state.grid(row=1, column=0, sticky="ew", padx=self.px(26),
+                             pady=(self.px(16), 0))
+
+        note = ThemedLabel(
+            body, palette,
+            i18n.t("The target connects from its own Bluetooth settings, where this PC is listed under its Bluetooth name. The list below only shows what is nearby: this PC never appears in it."),
+            tone="muted", font=theme.UI_FONT_SMALL, wraplength=self.px(520))
+        note.grid(row=2, column=0, sticky="ew", padx=self.px(26),
+                  pady=(self.px(6), 0))
+        self.devices_note = note
+
+        card = Card(body, palette, padding=1)
+        card.grid(row=3, column=0, sticky="nsew", padx=self.px(26),
+                  pady=(self.px(12), 0))
+        card.inner.columnconfigure(0, weight=1)
+        card.inner.rowconfigure(0, weight=1)
+        # width=1 for the same reason as the log: the default 80 columns would
+        # be wider than the page.
+        self.nearby_text = tk.Text(card.inner, wrap="none", height=14, width=1,
+                                   font=theme.MONO_FONT, state="disabled",
+                                   padx=8, pady=6, borderwidth=0,
+                                   highlightthickness=0)
+        theme.style_text(self.nearby_text, palette)
+        self.nearby_text.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(card.inner, orient="vertical",
+                               command=self.nearby_text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.nearby_text.configure(yscrollcommand=scroll.set)
+
+        tools = tk.Frame(body, background=palette.bg)
+        tools.grid(row=4, column=0, sticky="ew", padx=self.px(26),
+                   pady=(self.px(10), self.px(16)))
+
+        self.scan_button = ttk.Button(tools, text=self._scan_label(),
+                                      command=self._toggle_scan)
+        self.scan_button.pack(side="left")
+        ttk.Button(tools, text=i18n.t("Clear"),
+                   command=self._clear_nearby).pack(side="left", padx=self.px(10))
+        self._paintable.extend([self.link_state, note, card, tools])
+        # Wrap both lines of text to the width the list card has: it spans the
+        # same insets, so neither can run past the window on a scaled desktop.
+        card.bind("<Configure>",
+                  lambda event: (
+                      note.configure(
+                          wraplength=max(self.px(200), event.width - self.px(4))),
+                      self.link_state.configure(
+                          wraplength=max(self.px(200), event.width - self.px(4)))),
+                  add="+")
+
+    def _show_link_state(self, state: dict[str, object] | None) -> None:
+        """Say what the link is doing, and note the moments it changes.
+
+        Nothing below the window keeps these times: the peripheral reports that a
+        host subscribed or left, and only the window can turn that into "since
+        when", which is what a user comparing two attempts wants to see.
+        """
+        now = time.time()
+        up = bool(state and state.get("connected"))
+        if up and not self._link_up:
+            self._link_since, self._link_ended = now, None
+        elif not up and self._link_up:
+            self._link_since, self._link_ended = None, now
+        self._link_up = up
+        if state is not None and "aborted" in str(state.get("advertising") or ""):
+            if self._abort_since is None:
+                self._abort_since = now
+        else:
+            self._abort_since = None
+        aborted_for = 0.0 if self._abort_since is None else now - self._abort_since
+        self.link_state.configure(
+            text=link_summary(state, since=self._link_since,
+                              last_up=self._link_ended, aborted_for=aborted_for))
+        self.link_state.set_tone("accent" if up else "muted")
+
+
+    def _scan_label(self) -> str:
+        return i18n.t("Stop scanning") if self._scanner.running else i18n.t("Scan")
+
+    def _toggle_scan(self) -> None:
+        if self._scanner.running:
+            self._scanner.stop()
+            self.scan_button.configure(text=self._scan_label())
+            return
+        self._start_scan()
+
+    def _start_scan(self) -> None:
+        """Begin scanning, and report why if the radio will not."""
+        try:
+            self._scanner.start()
+        except Exception as exc:  # noqa: BLE001 - the reason is what matters
+            self._notify(str(exc), error=True)
+            log.warning("cannot scan for devices: %s", exc)
+            return
+        self.scan_button.configure(text=self._scan_label())
+        self._pump_scan()
+
+    def _pump_scan(self) -> None:
+        if self._closing or not self._scanner.running:
+            return
+        seen = self._scanner.snapshot()
+        lines = []
+        for device in seen:
+            services = ",".join(device.services[:4])
+            lines.append(f"  {device.rssi:5} dBm  {device.address}  "
+                         f"{device.name or i18n.t("unnamed")}"
+                         f"{'  ' + services if services else ''}")
+        if not lines:
+            lines = ["  " + i18n.t("No devices seen yet")]
+        self.nearby_text.configure(state="normal")
+        self.nearby_text.delete("1.0", "end")
+        self.nearby_text.insert("end", "\n".join(lines) + "\n")
+        self.nearby_text.configure(state="disabled")
+        self.root.after(SCAN_POLL_MS, self._pump_scan)
+
+    def _clear_nearby(self) -> None:
+        self._scanner.clear()
+        self.nearby_text.configure(state="normal")
+        self.nearby_text.delete("1.0", "end")
+        self.nearby_text.configure(state="disabled")
+
     # -- the bridge itself ------------------------------------------------
 
     def _bridge_label(self) -> str:
@@ -720,7 +1125,7 @@ class SettingsWindow:
     def toggle_bridge(self) -> None:
         """Hold the bridge still, or let it go again.
 
-        The host keeps running and the board stays paired; only the routing stops,
+        The host keeps running and the target stays paired; only the routing stops,
         and the PC gets its keyboard and mouse back while it is held.
         """
         self._bridge_paused = not self._bridge_paused
@@ -744,6 +1149,10 @@ class SettingsWindow:
             else:
                 page.grid_remove()
         self.sidebar.select(key)
+        # Opening the list starts the scan: a page whose only content is "press
+        # Scan" is a step nobody wants to take twice.
+        if key == "nearby" and not self._scanner.running:
+            self._start_scan()
         if key in self._page_canvas:
             self._sync_page(key)
             self._page_canvas[key].yview_moveto(0.0)
@@ -762,39 +1171,18 @@ class SettingsWindow:
         self._loading = True
         widgets.set_animated(False)
         try:
-            for name, variable in self._variables.items():
-                value = self.form.values.get(name, "")
-                field = FIELDS_BY_NAME.get(name)
-                if isinstance(variable, tk.BooleanVar):
-                    variable.set(bool(value))
-                elif field is not None and field.kind == "choice":
-                    # A dropdown shows a label; the value it stands for is what
-                    # the form holds and what is written to the file.
-                    labels = choice_labels(field)
-                    raw = str(value)
-                    variable.set(labels[field.choices.index(raw)]
-                                 if raw in field.choices else "")
-                else:
-                    variable.set(str(value))
+            for name, control in self._controls.items():
+                control.write(self.form.values.get(name, ""))
         finally:
             self._loading = False
             widgets.set_animated(True)
 
     def _read(self) -> dict[str, object]:
-        for name, variable in self._variables.items():
-            field = FIELDS_BY_NAME.get(name)
-            if field is not None:
-                if field.kind == "choice":
-                    value = choice_value(field, variable.get())
-                    if value is not None:
-                        self.form.values[name] = value
-                else:
-                    self.form.values[name] = variable.get()
-        settings = self.form.settings(self.settings)
-        for name, variable in self._variables.items():
-            if name in startup.APP_FIELDS:
-                settings[name] = bool(variable.get())
-        return settings
+        for name, control in self._controls.items():
+            value = control.read()
+            if value is not None:
+                self.form.values[name] = value
+        return self.form.settings(self.settings)
 
     # -- actions ----------------------------------------------------------
 
@@ -823,8 +1211,10 @@ class SettingsWindow:
             settings = self._read()
             built = config.build(settings)
         except config.ConfigError as exc:
+            # The controls keep what was typed: filling the form again from the
+            # last saved settings would take a line out from under the cursor,
+            # and the half-finished edit is the thing the message is about.
             self._notify(str(exc), error=True)
-            self._fill(self.settings)
             return
         self.settings = settings
         # The language is the one setting that changes the window itself.
@@ -885,16 +1275,15 @@ class SettingsWindow:
         theme.apply(self.root, ttk.Style(self.root), palette, self.scale)
         self.root.configure(background=palette.bg)
         self.content.configure(background=palette.bg)
-        self.message.configure(background=palette.bg, foreground=palette.muted)
         self.sidebar.repaint(palette)
         for widget in self._paintable:
             repaint = getattr(widget, "repaint", None)
             if repaint is not None:
                 repaint(palette)
-        for row in getattr(self, "status_rows", {}).values():
-            row.configure(background=palette.surface, foreground=palette.fg)
-        if hasattr(self, "log_text"):
-            theme.style_text(self.log_text, palette)
+        for name in ("log_text", "nearby_text"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                theme.style_text(widget, palette)
         self._apply_caption(palette)
 
     def _apply_caption(self, palette: theme.Theme) -> None:
@@ -916,6 +1305,7 @@ class SettingsWindow:
             self.root.bind("<Destroy>", self._cancel_timers, add="+")
 
     def _cancel_timers(self, event=None) -> None:
+        self._scanner.stop()
         """Drop the timers that are still pending.
 
         A timer that fires after its widget is gone is reported by Tk as an
@@ -982,7 +1372,10 @@ class SettingsWindow:
             self.root.after(POLL_MS, self._pump_events)
 
     def _pump_log(self) -> None:
-        lines, total = self.log_buffer.snapshot(self._log_lines)
+        # INFO and above: the window is for whoever is using the program, and a
+        # debug line about an asyncio proactor is not something they can act on.
+        lines, total = self.log_buffer.snapshot(self._log_lines,
+                                                level=logging.INFO)
         if self._paused:
             # The cursor stays where it is, so nothing is lost and the same
             # lines are handed over again once the view is let go.
@@ -1010,7 +1403,8 @@ class SettingsWindow:
     def _pump_status(self) -> None:
         try:
             state = self.service.status()
-        except Exception:  # noqa: BLE001 - the window outlives a failed service
+        except Exception as exc:  # noqa: BLE001 - the window outlives a failure
+            diagnostics.failed("reading the service status", exc)
             state = None
         if state is not None and hasattr(self, "status_rows"):
             cursor = state["cursor"]
@@ -1029,6 +1423,10 @@ class SettingsWindow:
             self.status_rows["link"].configure(
                 text=f"{link}   {written} {state['written']}   "
                      f"{bad} {state['bad']}")
+        if hasattr(self, "link_state"):
+            # Outside the guard above: a service that cannot be asked is itself
+            # worth saying on the Devices page.
+            self._show_link_state(state)
         if not self._closing:
             self.root.after(POLL_MS, self._pump_status)
 
@@ -1047,9 +1445,10 @@ class SettingsWindow:
     def _notify(self, message: str, error: bool = False) -> None:
         if error:
             log.warning("%s", message)
-        self.message.configure(
-            text=message,
-            foreground="#e06c75" if error else self.palette.muted)
+        self.message.configure(text=message)
+        self.message.set_colour("#e06c75" if error else None)
+        if not error:
+            self.message.set_tone("muted")
         if self._message_job is not None:
             self.root.after_cancel(self._message_job)
         self._message_job = self.root.after(6000, self._clear_message)
@@ -1064,6 +1463,18 @@ class SettingsWindow:
             os.startfile(path)  # noqa: S606 - opening our own settings file
         except OSError:
             subprocess.Popen(["notepad.exe", path])  # noqa: S607
+
+    @staticmethod
+    def _open_url(url: str) -> None:
+        """Hand a web address to the default browser.
+
+        No notepad fallback: an address that fails to open is a browser problem,
+        and opening it as text would be worse than doing nothing.
+        """
+        try:
+            os.startfile(url)  # noqa: S606 - a web address, not a file
+        except OSError as exc:
+            diagnostics.failed("opening the repository", exc)
 
     # -- run --------------------------------------------------------------
 

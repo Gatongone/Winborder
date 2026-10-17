@@ -1,0 +1,104 @@
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  PYTHON: "3.13"
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      number: ${{ steps.read.outputs.number }}
+    steps:
+      # The tag is the version: nothing has to be edited before publishing, and a
+      # release cannot name a number the tree does not build from, because the
+      # number is written into the source on the way through.
+      - name: Take the version from the tag
+        id: read
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          number="${tag#v}"
+          if ! printf '%s' "$number" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::tag $tag is not v<major>.<minor>.<patch>"
+            exit 1
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "building $number"
+
+  tests:
+    name: tests
+    runs-on: windows-latest
+    needs: version
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON }}
+      - name: Install the runtime dependencies
+        run: pip install winrt-runtime winrt-Windows.Devices.Bluetooth winrt-Windows.Devices.Bluetooth.Advertisement winrt-Windows.Devices.Bluetooth.GenericAttributeProfile winrt-Windows.Storage.Streams winrt-Windows.Foundation
+      - name: Run the tests
+        run: python -m unittest discover -s tests
+
+  host:
+    name: host
+    runs-on: windows-latest
+    needs: [version, tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON }}
+      - name: Install the build dependencies
+        run: pip install pyinstaller winrt-runtime winrt-Windows.Devices.Bluetooth winrt-Windows.Devices.Bluetooth.Advertisement winrt-Windows.Devices.Bluetooth.GenericAttributeProfile winrt-Windows.Storage.Streams winrt-Windows.Foundation
+      - name: Stamp the tag's version into the source
+        run: python .github/tools/version.py --set "${{ needs.version.outputs.number }}"
+      - name: Build the executable
+        run: python .github/tools/build_exe.py
+      - name: Build the installer
+        run: python .github/tools/build_installer.py --no-exe
+      - name: Check what was built
+        run: |
+          Get-Item dist/Winborder.exe | Select-Object Name, Length
+          Get-Item "dist/Winborder-${{ needs.version.outputs.number }}-Setup.exe" | Select-Object Name, Length
+          $info = (Get-Item dist/Winborder.exe).VersionInfo
+          $info | Format-List CompanyName, FileVersion, ProductVersion, LegalCopyright
+          if ($info.ProductVersion -ne "${{ needs.version.outputs.number }}") {
+            throw "the executable says '$($info.ProductVersion)', the tag says '${{ needs.version.outputs.number }}'"
+          }
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "dist/Winborder-${{ needs.version.outputs.number }}-Setup.exe" "dist/Winborder.exe" --clobber
+
+  bump:
+    name: bump
+    runs-on: ubuntu-latest
+    needs: [version, host]
+    steps:
+      # After the assets are attached, the branch is told which version it released,
+      # so the next build from the source shows the last release rather than the
+      # number before it. The release itself is complete by this point, and a
+      # failed push says so instead of failing the run.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Write the released version into the branch
+        run: python3 .github/tools/version.py --set "${{ needs.version.outputs.number }}"
+      - name: Commit it
+        run: |
+          if git diff --quiet; then
+            echo "the branch already carries ${{ needs.version.outputs.number }}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: release ${{ needs.version.outputs.number }}"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}" \
+            || echo "::warning::the version commit was not pushed; the release is complete"

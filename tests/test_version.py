@@ -7,12 +7,24 @@ build.
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from tools import version
 from winborder import __version__
+
+# The build and release scripts live under .github/tools because they are only
+# used when publishing, so this loads the version module by path rather than by
+# package name: where the directory sits is then not something the test depends
+# on, and .github is not on sys.path.
+_TOOLS = Path(__file__).resolve().parents[1] / ".github" / "tools"
+_spec = importlib.util.spec_from_file_location("winborder_build_version",
+                                               _TOOLS / "version.py")
+version = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = version
+_spec.loader.exec_module(version)
 
 
 class TestVersion(unittest.TestCase):
@@ -85,6 +97,70 @@ class TestVersionResource(unittest.TestCase):
                                   "VarStruct")}
         built = eval(text, namespace)                 # noqa: S307 - our own file
         self.assertIsInstance(built, namespace["VSVersionInfo"])
+
+
+class TestStamping(unittest.TestCase):
+    """A release takes its number from its tag, so the file has to take one."""
+
+    def setUp(self) -> None:
+        original = version.__version__
+        self.addCleanup(setattr, version, "__version__", original)
+
+    def source(self, text: str = '__version__ = "0.1.0"\n') -> Path:
+        """A file written as bytes, so a test can name its line endings."""
+        path = Path(tempfile.mkdtemp(prefix="winborder_stamp_")) / "__init__.py"
+        path.write_bytes(text.encode("utf-8"))
+        return path
+
+    def test_it_writes_the_number(self) -> None:
+        path = self.source()
+        self.assertEqual(version.set_version("2.5.1", path), "2.5.1")
+        self.assertIn('__version__ = "2.5.1"', path.read_text(encoding="utf-8"))
+
+    def test_it_leaves_the_rest_of_the_file_alone(self) -> None:
+        path = self.source('"""Doc."""\n\nfrom __future__ import annotations\n\n'
+                           '__version__ = "0.1.0"\n\n__all__ = ["__version__"]\n')
+        version.set_version("2.5.1", path)
+        text = path.read_text(encoding="utf-8")
+        self.assertIn('"""Doc."""', text)
+        self.assertIn('__all__ = ["__version__"]', text)
+        self.assertEqual(text.count("__version__"), 2)
+
+    def test_it_moves_the_version_the_build_reads(self) -> None:
+        """One process may read the version after writing it."""
+        version.set_version("2.5.1", self.source())
+        self.assertEqual(version.version(), "2.5.1")
+        self.assertEqual(version.file_version(), "2.5.1.0")
+
+    def test_a_number_that_is_not_a_version_is_refused(self) -> None:
+        path = self.source()
+        for bad in ("2.5", "v2.5.1", "latest", "", "2.5.1.0", "2.5.1-"):
+            with self.subTest(number=bad):
+                with self.assertRaises(ValueError):
+                    version.set_version(bad, path)
+        self.assertIn("0.1.0", path.read_text(encoding="utf-8"))
+
+    def test_a_second_line_is_refused(self) -> None:
+        path = self.source('__version__ = "0.1.0"\n__version__ = "0.2.0"\n')
+        with self.assertRaises(ValueError):
+            version.set_version("2.5.1", path)
+
+    def test_it_keeps_the_line_endings(self) -> None:
+        """A stamp must not turn one line into a whole-file diff."""
+        path = self.source('"""Doc."""\r\n\r\n__version__ = "0.1.0"\r\n')
+        version.set_version("2.5.1", path)
+        raw = path.read_bytes()
+        self.assertEqual(raw.count(b"\r\n"), 3)
+        self.assertEqual(raw.count(b"\n"), 3)
+
+    def test_a_prerelease_tag_survives(self) -> None:
+        path = self.source()
+        version.set_version("2.5.1-rc1", path)
+        self.assertIn('"2.5.1-rc1"', path.read_text(encoding="utf-8"))
+
+    def test_the_source_itself_carries_one_line(self) -> None:
+        found = version.LINE.findall(version.SOURCE.read_text(encoding="utf-8"))
+        self.assertEqual(len(found), 1)
 
 
 if __name__ == "__main__":

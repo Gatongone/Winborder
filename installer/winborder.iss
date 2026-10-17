@@ -1,6 +1,6 @@
 ; Winborder installer.
 ;
-; Built by tools/build_installer.py, which passes the version, the publisher and
+; Built by .github/tools/build_installer.py, which passes the version, the publisher and
 ; the executable in, so nothing here has to be kept in step by hand:
 ;
 ;   iscc /DAppVersion=2.0.0 /DCopyrightLine="..." installer\winborder.iss

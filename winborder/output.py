@@ -5,14 +5,14 @@ from __future__ import annotations
 import logging
 from typing import Protocol
 
-from . import model, win32
+from . import diagnostics, model, win32
 from .input import InputEngine
 
 log = logging.getLogger("winborder.output")
 
 
 class FrameSink(Protocol):
-    def send(self, msg_type: int, payload: bytes) -> bool:
+    def send(self, kind: str, payload: bytes) -> bool:
         ...
 
 
@@ -35,7 +35,7 @@ class EffectSink:
         notes: list[str] = []
         for effect in effects:
             if isinstance(effect, model.SendFrame):
-                if self._frames.send(effect.msg_type, effect.payload):
+                if self._frames.send(effect.kind, effect.payload):
                     self.sent_frames += 1
                 else:
                     self.failed_frames += 1
@@ -77,8 +77,8 @@ class EffectSink:
         """Undo every PC-side effect. Safe to call in any state."""
         try:
             self._engine.release_clip()
-        except Exception:
-            log.debug("release_clip failed during shutdown", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - shutdown has to finish
+            diagnostics.failed("releasing the cursor confinement", exc)
         self.clip_active = False
         self._engine.suppress_keyboard = False
         self._engine.suppress_mouse = False

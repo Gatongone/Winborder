@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from winborder import cli, config, ipc, keymap, model
+from winborder import cli, config, hid, keymap, model
 
 
 def write(settings: dict) -> Path:
@@ -54,10 +54,15 @@ class TestKeyTables(unittest.TestCase):
 class TestSettingsFile(unittest.TestCase):
     def test_defaults_cover_every_setting(self) -> None:
         written = config.defaults()
-        for name in config.LINK_FIELDS:
-            self.assertIn(name, written)
         for field in dataclasses.fields(model.Config):
             self.assertIn(field.name, written)
+
+    def test_defaults_carry_no_link_settings(self) -> None:
+        """The port, baud rate and transport went with the serial bridge."""
+        written = config.defaults()
+        for name in ("port", "baudrate", "transport"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, written)
 
     def test_written_defaults_load_back_as_defaults(self) -> None:
         path = write(config.defaults())
@@ -110,9 +115,23 @@ class TestSettingsFile(unittest.TestCase):
         with self.assertRaises(config.ConfigError):
             config.read(Path(tempfile.gettempdir()) / "winborder-absent.json")
 
-    def test_link_settings_are_separated(self) -> None:
-        settings = config.read(write({"port": "COM7", "side": "left"}))
-        self.assertEqual(config.link_settings(settings), {"port": "COM7"})
+    def test_the_serial_settings_are_gone(self) -> None:
+        """They belonged to the bridge board, which no longer exists.
+
+        A file still carrying one is a file from the old version, and the answer
+        is to say so rather than to keep accepting it: nothing here is a runtime
+        setting any more.
+        """
+        for name in ("port", "baudrate", "transport"):
+            with self.subTest(name=name):
+                with self.assertRaises(config.ConfigError):
+                    config.read(write({name: "COM7"}))
+
+    def test_defaults_carry_no_serial_setting(self) -> None:
+        written = config.defaults()
+        for name in ("port", "baudrate", "transport"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, written)
 
 
 class TestCommandLinePrecedence(unittest.TestCase):
@@ -163,7 +182,7 @@ class TestRemap(unittest.TestCase):
 
     def states(self, effects: list[model.Effect]) -> list[bytes]:
         return [e.payload for e in effects
-                if isinstance(e, model.SendFrame) and e.msg_type == ipc.MsgType.STATE]
+                if isinstance(e, model.SendFrame) and e.kind == hid.KEYBOARD]
 
     def router(self, remap: tuple[tuple[int, int], ...]) -> model.Router:
         cfg = model.Config(side=model.Side.RIGHT, remap=remap)
@@ -176,7 +195,8 @@ class TestRemap(unittest.TestCase):
         router = self.router(((keymap.vk_from_name("CapsLock"),
                                keymap.usage_from_name("Escape")),))
         effects = router.tick([model.KeyPress(0x14, True)], 1000.1, (1919, 540))
-        self.assertEqual(self.states(effects)[-1][2], keymap.usage_from_name("Escape"))
+        # The report is [modifiers][k0..k6], so the first key is at index 1.
+        self.assertEqual(self.states(effects)[-1][1], keymap.usage_from_name("Escape"))
 
     def test_remap_can_target_a_modifier(self) -> None:
         router = self.router(((keymap.vk_from_name("CapsLock"),
@@ -184,12 +204,13 @@ class TestRemap(unittest.TestCase):
         effects = router.tick([model.KeyPress(0x14, True)], 1000.1, (1919, 540))
         state = self.states(effects)[-1]
         self.assertEqual(state[0], keymap.MOD_LEFT_CTRL)
-        self.assertEqual(state[2:], b"\x00" * 6)
+        # A modifier is a bit rather than a slot, so every slot stays empty.
+        self.assertEqual(state[1:], b"\x00" * hid.KEY_SLOTS)
 
     def test_unmapped_keys_are_untouched(self) -> None:
         router = self.router(())
         effects = router.tick([model.KeyPress(0x41, True)], 1000.1, (1919, 540))
-        self.assertEqual(self.states(effects)[-1][2], 0x04)
+        self.assertEqual(self.states(effects)[-1][1], 0x04)
 
 
 if __name__ == "__main__":

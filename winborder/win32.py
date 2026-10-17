@@ -57,7 +57,9 @@ RIM_TYPEMOUSE = 0
 MOUSE_MOVE_ABSOLUTE = 0x01
 
 HWND_MESSAGE = -3
-_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+#: ShowWindow command: un-minimise and show. A window hidden to the notification
+#: area has to be restored before it can be the foreground window.
+SW_RESTORE = 9
 _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
 
 
@@ -274,30 +276,110 @@ def enable_dpi_awareness() -> str:
     return "unavailable"
 
 
-def verify_coordinate_space() -> str:
-    """Report whether screen metrics and the physical monitor agree."""
+BLUETOOTH_MAX_NAME_SIZE = 248
+
+
+class _BluetoothFindRadioParams(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD)]
+
+
+class _BluetoothRadioInfo(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("address", ctypes.c_ulonglong),
+        ("szName", ctypes.c_wchar * BLUETOOTH_MAX_NAME_SIZE),
+        ("ulClassofDevice", ctypes.c_ulong),
+        ("lmpSubversion", ctypes.c_ushort),
+        ("manufacturer", ctypes.c_ushort),
+    ]
+
+
+def bluetooth_name() -> str:
+    """The name this PC's own Bluetooth radio advertises, or "" if unknown.
+
+    This is the name a target shows in its list, and it is not the computer name:
+    Windows keeps a separate Bluetooth name, so a PC that was renamed can go on
+    advertising the old one, and a name set by hand has nothing to do with the
+    hostname at all. Guessing it from the hostname is how the wrong name ends up
+    in the instructions.
+
+    There is no WinRT call for it; ``BluetoothGetRadioInfo`` is the one that
+    reports it, and it needs no elevation.
+    """
+    try:
+        bthprops = ctypes.WinDLL("bthprops.cpl")
+        find = bthprops.BluetoothFindFirstRadio
+        find.restype = wintypes.HANDLE
+        find.argtypes = [ctypes.POINTER(_BluetoothFindRadioParams),
+                         ctypes.POINTER(wintypes.HANDLE)]
+        get_info = bthprops.BluetoothGetRadioInfo
+        get_info.restype = wintypes.DWORD
+        get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_BluetoothRadioInfo)]
+        close = bthprops.BluetoothFindRadioClose
+        close.restype = wintypes.BOOL
+        close.argtypes = [wintypes.HANDLE]
+    except (AttributeError, OSError):
+        log.debug("no Bluetooth radio API on this system", exc_info=True)
+        return ""
+
+    params = _BluetoothFindRadioParams(
+        dwSize=ctypes.sizeof(_BluetoothFindRadioParams))
+    radio = wintypes.HANDLE()
+    finder = find(ctypes.byref(params), ctypes.byref(radio))
+    if not finder:
+        log.debug("no Bluetooth radio to ask for a name")
+        return ""
+    try:
+        info = _BluetoothRadioInfo()
+        info.dwSize = ctypes.sizeof(_BluetoothRadioInfo)
+        if get_info(radio, ctypes.byref(info)) != 0:
+            log.debug("BluetoothGetRadioInfo refused the request")
+            return ""
+        return info.szName
+    finally:
+        close(finder)
+
+
+def focus_window(title: str) -> bool:
+    """Bring a window of this session to the front, restoring it if it is hidden.
+
+    The windows are enumerated rather than looked up by title: the title is read
+    for each one, so a second copy of the host finds the first by what it says
+    rather than by guessing at a class name. A window hidden to the notification
+    area still exists and is found this way, which is the case that matters --
+    starting the program again is how a user with no visible window asks for it.
+
+    Returns False when no window carries the title.
+    """
     user32 = ctypes.WinDLL("user32", use_last_error=True)
-    logical_w = user32.GetSystemMetrics(0)
-    logical_h = user32.GetSystemMetrics(1)
+    user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 
-    class MonitorInfo(ctypes.Structure):
-        _fields_ = [
-            ("cbSize", wintypes.DWORD),
-            ("rcMonitor", RECT),
-            ("rcWork", RECT),
-            ("dwFlags", wintypes.DWORD),
-        ]
+    found: list[int] = []
 
-    monitor = user32.MonitorFromWindow(user32.GetDesktopWindow(), 2)
-    info = MonitorInfo()
-    info.cbSize = ctypes.sizeof(MonitorInfo)
-    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-        return f"logical {logical_w}x{logical_h} (monitor query failed)"
-    phys_w = info.rcMonitor.right - info.rcMonitor.left
-    phys_h = info.rcMonitor.bottom - info.rcMonitor.top
-    if (logical_w, logical_h) == (phys_w, phys_h):
-        return f"{phys_w}x{phys_h}"
-    return f"mismatch: logical {logical_w}x{logical_h} vs physical {phys_w}x{phys_h}"
+    def visit(handle, _param) -> bool:
+        length = user32.GetWindowTextLengthW(handle)
+        if length:
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(handle, buffer, length + 1)
+            if buffer.value == title:
+                found.append(handle)
+                return False               # the first one will do
+        return True
+
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(visit)
+    user32.EnumWindows(ctypes.cast(callback, ctypes.c_void_p), 0)
+    if not found:
+        log.debug("no window titled %r to bring forward", title)
+        return False
+    user32.ShowWindow(found[0], SW_RESTORE)
+    user32.SetForegroundWindow(found[0])
+    return True
 
 
 def get_cursor_pos() -> tuple[int, int]:
@@ -348,13 +430,6 @@ def primary_screen_rect() -> tuple[int, int, int, int]:
     return left, top, left + width, top + height
 
 
-def get_clip_rect() -> tuple[int, int, int, int] | None:
-    rect = RECT()
-    if not _user32.GetClipCursor(ctypes.byref(rect)):
-        return None
-    return rect.left, rect.top, rect.right, rect.bottom
-
-
 def release_clip_global() -> None:
     """Release the session-wide ClipCursor confinement."""
     _user32.ClipCursor(None)
@@ -374,7 +449,8 @@ class ClipGuard:
             cls._instance = ClipGuard()
         return cls._instance
 
-    def acquire(self, side: str = "right") -> None:
+    def acquire(self) -> None:
+        """Take a share of the confinement; the last release lifts it."""
         self.depth += 1
 
     def release(self) -> None:
@@ -394,95 +470,3 @@ class ClipGuard:
         atexit.register(cls.instance().force_release)
 
 
-def install_clip_guard() -> bool:
-    """Place the process in a job object that kills on close.
-
-    Windows offers no way to run code when a process is force-terminated.
-    A job object is the only kernel-level guarantee: when the last handle
-    closes, the kernel terminates the process and the session clip state is
-    released with it.
-
-    Returning False means the guard is unavailable (for example when the
-    process already belongs to a non-nestable job). Callers must surface this
-    because a force-kill would otherwise leave the cursor confined.
-    """
-    try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-        kernel32.SetInformationJobObject.restype = wintypes.BOOL
-        kernel32.SetInformationJobObject.argtypes = [
-            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD
-        ]
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-        kernel32.AssignProcessToJobObject.argtypes = [
-            wintypes.HANDLE, wintypes.HANDLE
-        ]
-        kernel32.IsProcessInJob.restype = wintypes.BOOL
-        kernel32.IsProcessInJob.argtypes = [
-            wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)
-        ]
-
-        in_job = wintypes.BOOL()
-        already = bool(
-            kernel32.IsProcessInJob(
-                kernel32.GetCurrentProcess(), None, ctypes.byref(in_job)
-            )
-            and in_job.value
-        )
-
-        job = kernel32.CreateJobObjectW(None, None)
-        if not job:
-            log.debug("CreateJobObjectW failed, err=%d", ctypes.get_last_error())
-            return False
-
-        class IoCounters(ctypes.Structure):
-            _fields_ = [
-                ("ReadOperationCount", ctypes.c_ulonglong),
-                ("WriteOperationCount", ctypes.c_ulonglong),
-                ("OtherOperationCount", ctypes.c_ulonglong),
-                ("ReadTransferCount", ctypes.c_ulonglong),
-                ("WriteTransferCount", ctypes.c_ulonglong),
-                ("OtherTransferCount", ctypes.c_ulonglong),
-            ]
-
-        class BasicLimitInformation(ctypes.Structure):
-            _fields_ = [
-                ("PerProcessUserTimeLimit", ctypes.c_longlong),
-                ("PerJobUserTimeLimit", ctypes.c_longlong),
-                ("LimitFlags", wintypes.DWORD),
-                ("MinimumWorkingSetSize", ctypes.c_size_t),
-                ("MaximumWorkingSetSize", ctypes.c_size_t),
-                ("ActiveProcessLimit", wintypes.DWORD),
-                ("Affinity", ctypes.c_size_t),
-                ("PriorityClass", wintypes.DWORD),
-                ("SchedulingClass", wintypes.DWORD),
-            ]
-
-        class ExtendedLimitInformation(ctypes.Structure):
-            _fields_ = [
-                ("BasicLimitInformation", BasicLimitInformation),
-                ("IoInfo", IoCounters),
-                ("ProcessMemoryLimit", ctypes.c_size_t),
-                ("JobMemoryLimit", ctypes.c_size_t),
-                ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                ("PeakJobMemoryUsed", ctypes.c_size_t),
-            ]
-
-        info = ExtendedLimitInformation()
-        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not kernel32.SetInformationJobObject(
-            job, 9, ctypes.byref(info), ctypes.sizeof(info)
-        ):
-            log.debug("SetInformationJobObject failed, err=%d",
-                      ctypes.get_last_error())
-            return False
-        if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
-            log.debug("AssignProcessToJobObject failed, already_in_job=%s, err=%d",
-                      already, ctypes.get_last_error())
-            return False
-        return True
-    except Exception:
-        log.debug("job object guard unavailable", exc_info=True)
-        return False

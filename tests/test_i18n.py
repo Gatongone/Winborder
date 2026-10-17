@@ -92,6 +92,51 @@ class TestTables(unittest.TestCase):
                     self.assertEqual(got, wanted,
                                      "the translated message names other fields")
 
+    def test_the_agreed_words_hold_in_every_string(self) -> None:
+        """The rules in i18n.py are wording, so a slip is a failing test.
+
+        Chinese named this machine 主机 in eight strings and PC in four, and used
+        both 这个 and 此. English named the PC "host" in one label and the target
+        "host" in the next, which is why the translations disagreed: the same word
+        pointed at opposite ends of the link.
+        """
+        for code, table in i18n.TRANSLATIONS.items():
+            for source, text in table.items():
+                with self.subTest(code=code, source=source):
+                    self.assertNotIn("host", source.lower(),
+                                     "the PC is the PC and the other side is the "
+                                     "target device; host names both")
+                    if code == "zh":
+                        for word in ("主机", "本机", "这个"):
+                            self.assertNotIn(word, text)
+
+    def test_every_description_starts_with_a_capital(self) -> None:
+        """One text was lower case and the rest upper, so the card read as two.
+
+        English and Russian show the case; Chinese, Japanese and Korean do not, so
+        they are not checked. A description is a note of its own, not a
+        continuation of the title beside it.
+        """
+        texts: set[str] = set()
+        for field in ui.FIELDS:
+            if field.hint:
+                texts.add(field.hint)
+        for _key, title, _icon, page_text, groups in ui.PAGES:
+            texts.update((title, page_text))
+            for group, _rows in groups:
+                texts.add(group)
+        for rows in (ui.STATUS_ROWS, ui.ABOUT_ROWS):
+            for _key, title, description in rows:
+                texts.update((title, description))
+        for text in texts:
+            with self.subTest(text=text):
+                self.assertTrue(text[:1].isupper() or not text[:1].isalpha(),
+                                "a description starts with a capital letter")
+                translated = i18n.TRANSLATIONS["ru"].get(text, "")
+                self.assertTrue(translated[:1].isupper()
+                                or not translated[:1].isalpha(),
+                                f"ru: {translated}")
+
     def test_every_string_of_the_window_is_translated(self) -> None:
         wanted = source_strings() | table_strings()
         self.assertGreater(len(wanted), 80)
@@ -212,6 +257,20 @@ class TestLanguageSetting(unittest.TestCase):
         shown = [name for _group, rows in pages["generic"]
                  for row in rows for name in row]
         self.assertIn(config.LOCALE_FIELD, shown)
+
+
+class TestPageIcons(unittest.TestCase):
+    def test_every_page_has_its_own_glyph(self) -> None:
+        """Two pages sharing a glyph reads as two names for one page."""
+        icons = [icon for _key, _title, icon, _text, _groups in ui.PAGES]
+        self.assertEqual(len(icons), len(set(icons)), f"reused: {icons}")
+
+    def test_the_sidebar_items_do_not_borrow_a_page_glyph(self) -> None:
+        page_icons = {icon for _key, _title, icon, _text, _groups in ui.PAGES}
+        self.assertNotIn("reload", page_icons,
+                         "the reload arrow belongs to Reload settings")
+        self.assertNotIn("pause", page_icons)
+        self.assertNotIn("quit", page_icons)
 
 
 class TestPageOrder(unittest.TestCase):

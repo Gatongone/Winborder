@@ -17,6 +17,9 @@ MOD_LEFT_CTRL = 0x01
 MOD_LEFT_SHIFT = 0x02
 MOD_LEFT_ALT = 0x04
 MOD_LEFT_GUI = 0x08
+# The upper half of the modifier byte the report map declares. Nothing sends
+# these today; they are here so the mask is one readable table rather than a
+# quarter of one, and so a right hand key mapped as a modifier has a name.
 MOD_RIGHT_CTRL = 0x10
 MOD_RIGHT_SHIFT = 0x20
 MOD_RIGHT_ALT = 0x40
@@ -33,8 +36,10 @@ HID_MODIFIER_LAST = 0xE7
 # name -> (virtual key, HID usage)
 KEY_NAMES: dict[str, tuple[int, int]] = {
     **{chr(ord("A") + i): (0x41 + i, 0x04 + i) for i in range(26)},
-    **{str(digit): (0x30 if digit == 10 else 0x30 + digit, 0x27 if digit == 10
-                    else 0x1E + digit - 1) for digit in range(1, 11)},
+    **{str(digit): (0x30 + digit, 0x1E + digit - 1) for digit in range(1, 10)},
+    # The zero key is named as its keycap reads: its virtual key code does not
+    # follow the other digits, and its usage ends the run they start.
+    "0": (0x30, 0x27),
     **{f"F{i}": (0x70 + i - 1, 0x3A + i - 1) for i in range(1, 13)},
     **{f"F{i}": (0x7C + i - 13, 0x68 + i - 13) for i in range(13, 25)},
     **{f"Numpad{i}": (0x60 + i, 0x62 if i == 0 else 0x58 + i) for i in range(10)},
@@ -59,6 +64,10 @@ KEY_NAMES: dict[str, tuple[int, int]] = {
     "Pause": (0x13, 0x48),
     "NumLock": (0x90, 0x53),
     "Menu": (0x5D, 0x65),
+    # Keys a Mac keyboard has where a PC one has PrintScreen and NumLock: Help
+    # is the key next to the function keys, Clear is the keypad's NumLock.
+    "Help": (0x2F, 0x75),
+    "Clear": (0x0C, 0x53),
     "Minus": (0xBD, 0x2D),
     "Equal": (0xBB, 0x2E),
     "BracketLeft": (0xDB, 0x2F),
@@ -75,7 +84,12 @@ KEY_NAMES: dict[str, tuple[int, int]] = {
     "NumpadSubtract": (0x6D, 0x56),
     "NumpadAdd": (0x6B, 0x57),
     "NumpadDecimal": (0x6E, 0x63),
-    "NumpadSeparator": (0x6C, 0x58),
+    # Usage 0x58 is Keypad ENTER, not a separator: the name follows the table.
+    # Most Windows layouts report the numpad Enter as a plain Return, so this
+    # name is only reachable through the list -- it exists to be a target.
+    "NumpadEnter": (0x6C, 0x58),
+    # The ISO key between the left Shift and the letters.
+    "NonUsBackslash": (0xE2, 0x64),
     "LeftCtrl": (0xA2, 0xE0),
     "LeftShift": (0xA0, 0xE1),
     "LeftAlt": (0xA4, 0xE2),

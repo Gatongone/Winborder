@@ -12,7 +12,6 @@ venv/
 # Build output
 build/
 build_*/
-firmware/*/build/
 
 # Editors
 .vscode/

@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import config as config_mod
-from . import i18n, ipc, link as link_mod, logbuffer, model, trace, win32
+from . import i18n, logbuffer, model, single, startup, trace, win32
 
 log = logging.getLogger("winborder")
 
@@ -45,9 +45,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--write-config", nargs="?", const=config_mod.default_path(),
                         metavar="PATH",
                         help="write every setting at its default value, then exit")
-    parser.add_argument("--port", help="serial port of the bridge device")
-    parser.add_argument("--baudrate", type=int,
-                        help=f"serial baud rate, default {ipc.DEFAULT_BAUDRATE}")
     parser.add_argument("--side", choices=[s.value for s in model.Side],
                         help="which side of the PC the target device sits on")
     parser.add_argument("--sensitivity", type=float,
@@ -66,10 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="disable returning by pulling the pointer towards the PC")
     parser.add_argument("--no-edge", action="store_true",
                         help="disable edge crossing, use F2 to arm it later")
-    parser.add_argument("--list-ports", action="store_true",
-                        help="list serial ports and exit")
-    parser.add_argument("--probe", action="store_true",
-                        help="find the port the bridge answers on, then exit")
     return parser
 
 
@@ -79,25 +72,6 @@ def configure_logging() -> None:
                         datefmt=logbuffer.DATE_FORMAT)
 
 
-def resolve_port(requested: str | None) -> str | None:
-    ports = link_mod.list_serial_ports()
-    if requested:
-        if requested not in ports:
-            log.warning("port %s is not present; available: %s",
-                        requested, ", ".join(ports) or "none")
-        return requested
-    guess = link_mod.suggest_port(ports)
-    if guess:
-        log.info("using detected port %s", guess)
-    return guess
-
-
-def find_working_port(baudrate: int) -> str | None:
-    for port in sorted(link_mod.list_serial_ports(),
-                       key=link_mod.port_index, reverse=True):
-        if link_mod.probe_port(port, baudrate):
-            return port
-    return None
 
 
 def load_settings(args: argparse.Namespace) -> dict[str, object]:
@@ -135,6 +109,28 @@ def make_config(settings: dict[str, object],
     return config_mod.build({**settings, **overrides})
 
 
+def _fail(message: str) -> int:
+    """Report a fatal startup problem and return the exit code for it.
+
+    A release build has no console, so logging an error and exiting leaves the
+    user with nothing at all to go on: the program appears simply not to start.
+    Ask a window to say what happened instead.
+    """
+    log.error("%s", message)
+    if startup.is_frozen():
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("Winborder", message)
+            root.destroy()
+        except Exception:
+            log.debug("could not show the failure window", exc_info=True)
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configure_logging()
@@ -143,51 +139,47 @@ def main(argv: list[str] | None = None) -> int:
         try:
             written = config_mod.write_default(args.write_config)
         except OSError as exc:
-            log.error("cannot write %s: %s", args.write_config, exc)
-            return 2
+            return _fail(i18n.t("cannot write {path}: {error}").format(
+                path=args.write_config, error=exc))
         print(f"wrote {written}")
+        return 0
+
+    # One copy per session. A second launch is the user asking for the window that
+    # is already open -- often because it went to the notification area -- so it
+    # hands over and leaves, before anything touches the radio or the cursor.
+    if not single.acquire():
+        if single.focus_existing():
+            log.info("already running; brought its window to the front")
+        else:
+            log.info("already running")
         return 0
 
     try:
         settings = load_settings(args)
         bridge_config = make_config(settings, args)
     except config_mod.ConfigError as exc:
-        log.error("%s", exc)
-        return 2
-    link = config_mod.link_settings(settings)
-    port_arg = args.port or str(link.get("port") or "") or None
-    baudrate = args.baudrate or int(link.get("baudrate") or ipc.DEFAULT_BAUDRATE)
-
-    if args.list_ports:
-        ports = link_mod.list_serial_ports()
-        print("\n".join(ports) if ports else "no serial ports found")
-        return 0
-
+        return _fail(str(exc))
     win32.enable_dpi_awareness()
-    if not win32.install_clip_guard():
-        log.warning("job object guard unavailable: a force kill may leave the "
-                    "cursor confined until %s is pressed", EXIT_KEYS)
+    # Nothing here needs the kernel's help: the cursor confinement is undone by
+    # the atexit handler, and every normal exit path reaches it. A job object
+    # that kills on close was tried for force kills and dropped: on Windows the
+    # job's handle cannot outlive the process that owns it, so it never fired,
+    # while a job object plus low level hooks plus a Run entry is exactly the
+    # shape an antivirus is built to stop.
     win32.ClipGuard.install_atexit()
     win32.release_clip_global()
 
-    if args.probe:
-        port = find_working_port(baudrate)
-        print(port if port else "no Winborder device found")
-        return 0 if port else 1
-
-    port = resolve_port(port_arg)
-    if not port:
-        log.error("no serial port available; connect the board or pass --port")
-        return 2
+    # The PC is the peripheral. Nothing connects until the target pairs and
+    # subscribes, which the service reports as the device link coming up.
+    log.info("advertising as a BLE HID peripheral; pair from the target's "
+             "Bluetooth settings")
 
     from .service import Service
 
-    service = Service(port, config=bridge_config, baudrate=baudrate)
+    service = Service(config=bridge_config)
     # The window shows every setting, so it needs all of them, not just the
     # ones this file happened to contain.
     service_settings = config_mod.complete(settings)
-    service_settings["port"] = port_arg or service_settings.get("port", "")
-    service_settings["baudrate"] = baudrate
 
     def on_signal(signum, frame) -> None:  # noqa: ARG001
         service.request_stop()

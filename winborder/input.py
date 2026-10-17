@@ -168,7 +168,7 @@ class InputEngine:
         self._install_raw_input()
         self._running.set()
         self._ready.set()
-        log.info("hooks installed, raw_input=%s", self._raw_ready)
+        log.debug("hooks installed, raw_input=%s", self._raw_ready)
 
         try:
             while self._running.is_set():
@@ -466,7 +466,7 @@ class InputEngine:
                         ctypes.WinError(ctypes.get_last_error()))
             return
         self._clipped = True
-        win32.ClipGuard.instance().acquire(side=side)
+        win32.ClipGuard.instance().acquire()
         if x is None or y is None:
             x, y = win32.get_cursor_pos()
         win32.set_cursor_pos(

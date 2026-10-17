@@ -9,16 +9,20 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import platform
 import tempfile
 import time
 import tkinter as tk
 import unittest
+from unittest import mock
 from pathlib import Path
 
+from tkinter import font as tkfc
 from tkinter import ttk
 
-from winborder import config, i18n, icon, logbuffer, model, startup, theme, \
-    trace, ui, widgets
+from winborder import config, hid, i18n, icon, keymap, logbuffer, model, startup, \
+    theme, trace, ui, widgets
+from winborder.widgets import filter_names
 
 
 class TestSettingsForm(unittest.TestCase):
@@ -29,7 +33,6 @@ class TestSettingsForm(unittest.TestCase):
                 if field.name == "remap":
                     continue          # the form edits it, the file stores it
                 self.assertIn(field.name, names)
-        self.assertTrue(set(config.LINK_FIELDS) <= names)
 
     def test_labels_are_unique(self) -> None:
         labels = [field.label for field in ui.FIELDS]
@@ -46,21 +49,23 @@ class TestSettingsForm(unittest.TestCase):
         form.values["panic_keys"] = "F12, LeftCtrl"
         self.assertEqual(form.settings({})["panic_keys"], ["F12", "LeftCtrl"])
 
-    def test_remap_is_edited_as_lines(self) -> None:
+    def test_remap_is_edited_as_pairs(self) -> None:
         form = ui.SettingsForm({"remap": {"CapsLock": "Escape"}})
-        self.assertEqual(form.values["remap"], "CapsLock=Escape")
-        form.values["remap"] = "CapsLock=LeftCtrl\nMenu=Escape"
+        self.assertEqual(form.values["remap"], [("CapsLock", "Escape")])
+        form.values["remap"] = [("CapsLock", "LeftCtrl"), ("Menu", "Escape")]
         self.assertEqual(form.settings({})["remap"],
                          {"CapsLock": "LeftCtrl", "Menu": "Escape"})
 
-    def test_blank_number_keeps_the_default(self) -> None:
+    def test_a_blank_number_keeps_the_default(self) -> None:
         form = ui.SettingsForm(config.defaults())
         form.values["pullback_distance"] = ""
         self.assertNotIn("pullback_distance", form.settings({}))
 
     def test_bad_input_is_rejected(self) -> None:
         for name, value in (("pullback_distance", "soon"), ("panic_keys", "Nope"),
-                            ("remap", "CapsLock"), ("remap", "Nope=Escape")):
+                            ("remap", [("CapsLock", "")]),
+                            ("remap", [("", "Escape")]),
+                            ("remap", [("Nope", "Escape")])):
             with self.subTest(name=name, value=value):
                 form = ui.SettingsForm(config.defaults())
                 form.values[name] = value
@@ -87,7 +92,7 @@ class TestSettingsWriteBack(unittest.TestCase):
         form = ui.SettingsForm(settings)
         form.values["side"] = "right"
         form.values["panic_keys"] = "F12"
-        form.values["remap"] = "CapsLock=Escape"
+        form.values["remap"] = [("CapsLock", "Escape")]
         edited = form.settings(settings)
 
         config.write(path, edited)
@@ -132,6 +137,40 @@ class TestLogBuffer(unittest.TestCase):
         self.assertEqual(total, 4)
 
 
+class TestLogLevels(unittest.TestCase):
+    """The log page is for whoever is using the program, not for me."""
+
+    def setUp(self) -> None:
+        self.buffer = logbuffer.LogBuffer(capacity=10)
+        self.log = logging.getLogger("winborder.levels")
+        self.log.setLevel(logging.DEBUG)
+        self.log.addHandler(self.buffer)
+        self.addCleanup(self.log.removeHandler, self.buffer)
+
+    def test_debug_lines_are_kept_but_not_offered(self) -> None:
+        self.log.debug("a proactor detail")
+        self.log.info("the target has the keyboard and mouse")
+        lines, total = self.buffer.snapshot(0, level=logging.INFO)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("the target has the keyboard", lines[0])
+        # The buffer still has both, and the reader is past both.
+        self.assertEqual(total, 2)
+        self.assertIn("a proactor detail", self.buffer.text())
+
+    def test_the_cursor_advances_past_what_was_hidden(self) -> None:
+        """Hiding a line must not make it appear later."""
+        self.log.debug("first")
+        _, seen = self.buffer.snapshot(0, level=logging.INFO)
+        self.log.info("second")
+        lines, _ = self.buffer.snapshot(seen, level=logging.INFO)
+        self.assertEqual([line.split()[-1] for line in lines], ["second"])
+
+    def test_everything_is_offered_at_debug(self) -> None:
+        self.log.debug("a proactor detail")
+        lines, _ = self.buffer.snapshot(0)
+        self.assertEqual(len(lines), 1)
+
+
 class TestRuntimeConfigChange(unittest.TestCase):
     def test_router_accepts_new_settings(self) -> None:
         router = model.Router(config=model.Config(side=model.Side.BOTTOM),
@@ -156,8 +195,9 @@ class TestRuntimeConfigChange(unittest.TestCase):
         effects = router.tick([model.KeyPress(0x41, True)], 1000.1, (1919, 540))
         states = [e.payload for e in effects
                   if isinstance(e, model.SendFrame)
-                  and e.msg_type == model.ipc.MsgType.STATE]
-        self.assertEqual(states[-1][2], 0x29)
+                  and e.kind == hid.KEYBOARD]
+        # [modifiers][k0..k6]: the first key slot is at index 1.
+        self.assertEqual(states[-1][1], 0x29)
 
 
 class TestStatusLine(unittest.TestCase):
@@ -275,13 +315,220 @@ class TestWidgetGeometry(unittest.TestCase):
     def test_every_icon_draws_something(self) -> None:
         canvas = tk.Canvas(self.root, width=32, height=32)
         for name in ("status", "link", "pointer", "edge", "keyboard", "log", "file",
-                     "reload", "quit"):
+                     "reload", "quit", "plus", "cross"):
             with self.subTest(icon=name):
                 widgets.draw_icon(canvas, name, 16, "#ffffff", "#000000")
                 self.assertTrue(canvas.find_all(), f"{name} drew nothing")
 
 
+class TestRemapList(unittest.TestCase):
+    """Remaps are edited as a list of lines, not as a block of text."""
+
+    def setUp(self) -> None:
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:            # no display available
+            self.skipTest(f"no display: {exc}")
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+        self.palette = theme.system_theme()
+        widgets.set_scale(theme.ui_scale(self.root))
+
+    def editor(self, changes: list[int] | None = None):
+        reported = changes if changes is not None else []
+        return widgets.RemapList(self.root, self.palette,
+                                 on_change=lambda: reported.append(1))
+
+    def test_it_starts_empty_and_says_so(self) -> None:
+        editor = self.editor()
+        self.assertEqual(editor.pairs(), [])
+        self.assertTrue(editor.empty.winfo_manager(), "the empty note is missing")
+
+    def test_a_line_is_one_remap(self) -> None:
+        editor = self.editor()
+        editor.add_row("CapsLock", "Escape")
+        editor.add_row("A", "B")
+        self.assertEqual(editor.pairs(), [("CapsLock", "Escape"), ("A", "B")])
+        self.assertFalse(editor.empty.winfo_manager(), "the empty note is still shown")
+
+    def test_a_line_with_nothing_in_it_is_not_a_remap(self) -> None:
+        editor = self.editor()
+        editor.add_row()
+        self.assertEqual(editor.pairs(), [])
+
+    def test_a_half_filled_line_is_kept_but_not_saved(self) -> None:
+        """A remap in progress is not an error, and it must stay on screen."""
+        editor = self.editor()
+        editor.add_row("CapsLock", "")
+        self.assertEqual(editor.pairs(), [])
+        self.assertEqual(len(editor._rows), 1)
+
+    def test_a_line_can_be_removed(self) -> None:
+        editor = self.editor()
+        editor.add_row("CapsLock", "Escape")
+        editor.add_row("A", "B")
+        editor._rows[0]["remove"].invoke()      # the ✕ of the first line
+        self.assertEqual(editor.pairs(), [("A", "B")])
+
+    def test_the_whole_list_can_be_replaced(self) -> None:
+        editor = self.editor()
+        editor.add_row("A", "B")
+        editor.set_pairs([("CapsLock", "Escape")])
+        self.assertEqual(editor.pairs(), [("CapsLock", "Escape")])
+        self.assertEqual(len(editor._rows), 1)
+
+    def test_a_blank_line_is_not_reported_as_an_edit(self) -> None:
+        """Reporting one would have the window commit, and rebuild, mid-edit."""
+        changes: list[int] = []
+        editor = self.editor(changes)
+        editor.add_row()
+        self.assertEqual(changes, [])
+
+    def test_naming_a_key_reports_a_change(self) -> None:
+        changes: list[int] = []
+        editor = self.editor(changes)
+        editor.add_row()
+        editor._rows[0]["source"].assign("CapsLock")
+        self.assertTrue(changes, "a key was set without reporting it")
+
+
+class TestKeyField(unittest.TestCase):
+    """A key is named by pressing it, not by finding it in a list of 116."""
+
+    def setUp(self) -> None:
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:            # no display available
+            self.skipTest(f"no display: {exc}")
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+        self.palette = theme.system_theme()
+        widgets.set_scale(theme.ui_scale(self.root))
+
+    class Event:
+        def __init__(self, keycode: int) -> None:
+            self.keycode = keycode
+
+    def field(self, value: str = ""):
+        return widgets.KeyField(self.root, self.palette, value)
+
+    def test_it_asks_for_a_key_when_it_is_empty(self) -> None:
+        self.assertEqual(self.field().cget("text"), i18n.t("Press a key"))
+
+    def test_pressing_a_key_names_it(self) -> None:
+        field = self.field()
+        field.capture()
+        field._pressed(self.Event(0x14))       # CapsLock
+        self.assertEqual(field.value, "CapsLock")
+        self.assertEqual(field.cget("text"), "CapsLock")
+
+    def test_a_key_that_is_not_in_the_map_is_refused(self) -> None:
+        field = self.field("Escape")
+        field.capture()
+        field._pressed(self.Event(0xFF))       # not a key the host knows
+        self.assertEqual(field.value, "Escape")
+
+    def test_a_field_that_was_only_clicked_stays_empty(self) -> None:
+        field = self.field()
+        field.capture()
+        field._give_up()                       # focus left without a key
+        self.assertEqual(field.value, "")
+
+    def test_pressing_a_key_reports_a_change(self) -> None:
+        changes: list[int] = []
+        field = widgets.KeyField(self.root, self.palette, "",
+                                 on_change=lambda: changes.append(1))
+        field.capture()
+        field._pressed(self.Event(0x41))       # A
+        self.assertTrue(changes)
+
+    def test_the_list_offers_every_key(self) -> None:
+        """The keys a keyboard lacks have another way in."""
+        field = self.field()
+        picker = field.pick()
+        self.addCleanup(picker.close)
+        self.assertEqual(picker.listbox.size(), len(keymap.KEY_NAMES))
+        picker.query.set("rightw")
+        self.assertEqual(list(picker.listbox.get(0, "end")),
+                         [name for name in filter_names(keymap.KEY_NAMES, "rightw")])
+        self.assertIn("RightWin", picker.listbox.get(0, "end"))
+
+    def test_choosing_from_the_list_sets_the_key(self) -> None:
+        field = self.field()
+        picker = field.pick()
+        self.addCleanup(picker.close)
+        picker.query.set("rightwin")
+        picker.listbox.selection_clear(0, "end")
+        picker.listbox.selection_set(0)
+        picker._choose()
+        self.assertEqual(field.value, "RightWin")
+
+
+class TestKeyListFilter(unittest.TestCase):
+    """The picker is searchable: 116 names is too many to scan."""
+
+    NAMES = ("RightWin", "LeftWin", "RightShift", "Escape")
+
+    def test_an_empty_query_keeps_everything(self) -> None:
+        self.assertEqual(widgets.filter_names(self.NAMES, ""), list(self.NAMES))
+
+    def test_a_query_narrows_the_list(self) -> None:
+        self.assertEqual(widgets.filter_names(self.NAMES, "right"),
+                         ["RightWin", "RightShift"])
+
+    def test_the_search_ignores_case_and_spaces(self) -> None:
+        self.assertEqual(widgets.filter_names(self.NAMES, "  WIn "),
+                         ["RightWin", "LeftWin"])
+
+    def test_nothing_matching_is_an_empty_list(self) -> None:
+        self.assertEqual(widgets.filter_names(self.NAMES, "z"), [])
+
+
+class TestThemedLabel(unittest.TestCase):
+    """A label that repaints itself, so the window does not have to remember."""
+
+    def setUp(self) -> None:
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:            # no display available
+            self.skipTest(f"no display: {exc}")
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+        widgets.set_scale(theme.ui_scale(self.root))
+
+    def test_it_starts_in_its_palette_colours(self) -> None:
+        label = widgets.ThemedLabel(self.root, theme.DARK, "x", tone="muted")
+        self.assertEqual(label.cget("foreground"), theme.DARK.muted)
+        self.assertEqual(label.cget("background"), theme.DARK.bg)
+
+    def test_a_repaint_follows_the_new_palette(self) -> None:
+        label = widgets.ThemedLabel(self.root, theme.DARK, "x")
+        label.repaint(theme.LIGHT)
+        self.assertEqual(label.cget("foreground"), theme.LIGHT.fg)
+        self.assertEqual(label.cget("background"), theme.LIGHT.bg)
+
+    def test_it_can_sit_on_a_card(self) -> None:
+        label = widgets.ThemedLabel(self.root, theme.DARK, "x", on="surface")
+        self.assertEqual(label.cget("background"), theme.DARK.surface)
+
+    def test_a_tone_can_change_and_still_follow_the_palette(self) -> None:
+        label = widgets.ThemedLabel(self.root, theme.DARK, "x", tone="muted")
+        label.set_tone("accent")
+        label.repaint(theme.LIGHT)
+        self.assertEqual(label.cget("foreground"), theme.LIGHT.accent)
+
+    def test_a_literal_colour_survives_a_repaint(self) -> None:
+        """An error line keeps its colour; the palette does not own it."""
+        label = widgets.ThemedLabel(self.root, theme.DARK, "x")
+        label.set_colour("#e06c75")
+        label.repaint(theme.LIGHT)
+        self.assertEqual(label.cget("foreground"), "#e06c75")
+        label.set_colour(None)
+        self.assertEqual(label.cget("foreground"), theme.LIGHT.fg)
+
+
 class TestStateAnimation(unittest.TestCase):
+
     """A control moves between its two states instead of jumping."""
 
     def setUp(self) -> None:
@@ -451,7 +698,7 @@ class TestWheelRouting(unittest.TestCase):
                 self.calls.append((steps, what))
 
         bridge, pointer = Canvas(), Canvas()
-        window = self.make({"bridge": bridge, "pointer": pointer}, "bridge")
+        window = self.make({"handoff": bridge, "pointer": pointer}, "handoff")
         window._on_wheel(self.Event(-120))          # wheel down scrolls down
         self.assertEqual(bridge.calls, [(1, "units")])
         self.assertEqual(pointer.calls, [])
@@ -465,7 +712,7 @@ class TestWheelRouting(unittest.TestCase):
                 self.calls.append((steps, what))
 
         canvas = Canvas()
-        window = self.make({"bridge": canvas}, "bridge")
+        window = self.make({"handoff": canvas}, "handoff")
         window._on_wheel(self.Event(120))           # wheel up scrolls up
         self.assertEqual(canvas.calls, [(-1, "units")])
 
@@ -479,12 +726,17 @@ class StubService:
 
     def __init__(self) -> None:
         self.paused: list[bool] = []
+        self.advertising = "started"
+        self.connected = True
+        self.name = "Winborder"
 
     def status(self) -> dict[str, object]:
         return {"mode": "pc", "paused": bool(self.paused and self.paused[-1]),
                 "side": "bottom", "cursor": (0.5, 1.0), "pointer": (0.5, 0.5),
                 "travel": 0.0, "frames": 0, "written": 0, "bad": 0,
-                "connected": True}
+                "connected": self.connected,
+                "advertising": self.advertising,
+                "name": self.name}
 
     def apply_config(self, config) -> None:
         pass
@@ -499,6 +751,101 @@ class StubService:
         pass
 
 
+class TestPathFitting(unittest.TestCase):
+    """A long path must not be broken in the middle of a file name.
+
+    Tk wraps a label at any character it likes, so the settings path came out as
+    ``…\\winborder.js`` over ``on``, which reads as two unrelated strings.
+    """
+
+    PATH = r"C:\Program Files\Winborder\winborder.json"
+
+    def test_a_path_that_fits_is_left_alone(self) -> None:
+        self.assertEqual(ui.wrap_path(self.PATH, 80), self.PATH)
+
+    def test_it_breaks_after_a_separator(self) -> None:
+        limit = 40
+        wrapped = ui.wrap_path(self.PATH, limit)
+        first, second = wrapped.split("\n")
+        self.assertTrue(first.endswith("\\"), first)
+        self.assertEqual(first + second, self.PATH, "the path was not kept whole")
+        self.assertEqual(second, "winborder.json", "the file name was cut")
+
+    def test_every_line_fits_the_column(self) -> None:
+        for limit in (12, 20, 28, 40, 51):
+            with self.subTest(limit=limit):
+                for line in ui.wrap_path(self.PATH, limit).split("\n"):
+                    self.assertLessEqual(len(line), max(limit, 8))
+
+    def test_a_single_long_name_is_shortened_in_the_middle(self) -> None:
+        wrapped = ui.wrap_path("C:\\" + "a" * 60, 20)
+        self.assertIn("…", wrapped)
+        for line in wrapped.split("\n"):
+            self.assertLessEqual(len(line), 20)
+
+    def test_shortening_keeps_both_ends(self) -> None:
+        shortened = ui.shorten_path(self.PATH, 20)
+        self.assertTrue(shortened.startswith("C:"))
+        self.assertTrue(shortened.endswith(".json"))
+        self.assertEqual(len(shortened), 20)
+
+
+class TestLinkSummary(unittest.TestCase):
+    """The Devices page has to say which way round the link is."""
+
+    def setUp(self) -> None:
+        i18n.set_language("en")
+        self.addCleanup(i18n.set_language, i18n.DEFAULT_LANGUAGE)
+
+    def test_a_subscriber_is_a_connection(self) -> None:
+        line = ui.link_summary({"connected": True, "advertising": "started"},
+                               since=time.time())
+        self.assertIn("connected since", line)
+
+    def test_waiting_names_the_pc_and_who_has_to_pair(self) -> None:
+        line = ui.link_summary({"connected": False, "advertising": "started",
+                                "name": "Winborder"})
+        self.assertIn("waiting for the target device to pair", line)
+        self.assertIn("Winborder", line)
+
+    def test_a_name_that_could_not_be_read_is_not_invented(self) -> None:
+        """The computer name is not the Bluetooth name, so it is not a fallback."""
+        line = ui.link_summary({"connected": False, "advertising": "started",
+                                "name": ""})
+        self.assertIn("waiting for the target device to pair", line)
+        self.assertNotIn(platform.node(), line)
+
+    def test_an_advertisement_windows_cut_short_is_reported(self) -> None:
+        line = ui.link_summary({"connected": False, "advertising": "aborted"},
+                               aborted_for=ui.ABORT_GRACE_S + 1.0)
+        self.assertIn("cut short", line)
+
+    def test_an_abort_while_it_restarts_is_not_a_fault(self) -> None:
+        """Every start reports aborted for a second or two, and that is normal."""
+        line = ui.link_summary({"connected": False, "advertising": "aborted"},
+                               aborted_for=0.2)
+        self.assertNotIn("cut short", line)
+        self.assertIn("not advertising", line)
+
+    def test_nothing_on_the_air_is_reported_as_such(self) -> None:
+        self.assertIn("not advertising", ui.link_summary(None))
+        self.assertIn("not advertising",
+                      ui.link_summary({"connected": False,
+                                       "advertising": "not started"}))
+
+    def test_the_moment_it_went_down_is_remembered(self) -> None:
+        line = ui.link_summary({"connected": False, "advertising": "started"},
+                               last_up=time.time())
+        self.assertIn("last connected at", line)
+
+    def test_a_live_subscription_outranks_a_stale_status(self) -> None:
+        """The status goes ABORTED and back while a host is connected."""
+        line = ui.link_summary({"connected": True, "advertising": "aborted"},
+                               since=time.time())
+        self.assertIn("connected since", line)
+        self.assertNotIn("cut short", line)
+
+
 class TestWindowLayout(unittest.TestCase):
     """The window has to fill its width, at whatever scale the display asks."""
 
@@ -508,7 +855,7 @@ class TestWindowLayout(unittest.TestCase):
         directory = tempfile.mkdtemp(prefix="winborder_layout_")
         try:
             self.window = ui.SettingsWindow(
-                StubService(), {"port": "COM10"},
+                StubService(), {"side": "left"},
                 str(Path(directory) / config.DEFAULT_FILENAME))
         except tk.TclError as exc:            # no display available
             self.skipTest(f"no display: {exc}")
@@ -539,6 +886,17 @@ class TestWindowLayout(unittest.TestCase):
         self.window._pump_status()
         self.assertEqual(self.window.status_rows["mode"].cget("text"),
                          i18n.t("Paused"))
+
+    def test_the_devices_page_says_what_the_link_is_doing(self) -> None:
+        self.window._closing = True
+        self.window._pump_status()
+        self.assertIn("connected since", self.window.link_state.cget("text"))
+
+        self.window.service.connected = False
+        self.window.service.advertising = "started"
+        self.window._pump_status()
+        self.assertIn("waiting for the target device to pair",
+                      self.window.link_state.cget("text"))
 
     def test_pages_fill_the_width(self) -> None:
         for key, canvas in self.window._page_canvas.items():
@@ -571,15 +929,76 @@ class TestWindowLayout(unittest.TestCase):
                                  "the bar must follow what the page needs")
 
     def test_cards_use_the_canvas_width(self) -> None:
-        self.window.show_page("bridge")
+        self.window.show_page("edge")
         self.window.root.update_idletasks()
-        canvas = self.window._page_canvas["bridge"]
+        canvas = self.window._page_canvas["edge"]
         body = canvas.winfo_children()[0]
         widths = [child.winfo_width() for child in body.winfo_children()
                   if isinstance(child, widgets.Card)]
         self.assertTrue(widths)
         # Cards keep the page margins and nothing more.
         self.assertGreater(min(widths), canvas.winfo_width() * 0.8)
+
+    def test_the_settings_path_is_not_cut_inside_a_name(self) -> None:
+        """The About card shows the path on one line, or after a separator."""
+        self.window.show_page("generic")
+        self.window.root.update_idletasks()
+        value = self.window.about_rows["settings"]
+        text = value.cget("text")
+        font = tkfc.Font(font=value.cget("font"))
+        for line in str(text).split("\n"):
+            with self.subTest(line=line):
+                self.assertLessEqual(font.measure(line),
+                                     int(value.cget("wraplength")),
+                                     "a line would wrap, cutting a name in half")
+        self.assertTrue(str(text).rstrip().endswith(".json"))
+
+    def test_a_remap_in_progress_survives_a_commit(self) -> None:
+        """Filling one side of a new line must not take the line away."""
+        self.window.show_page("keyboard")
+        self.window.remap_add.invoke()
+        self.window.remap_list._rows[0]["source"].assign("CapsLock")
+        self.window._commit()                  # what the commit timer does
+        self.assertEqual(len(self.window.remap_list._rows), 1,
+                         "the line being edited was rebuilt away")
+        self.assertEqual(self.window.settings.get("remap"), {})
+
+    def test_the_plus_adds_a_line(self) -> None:
+        self.window.show_page("keyboard")
+        self.assertEqual(self.window.remap_list.pairs(), [])
+        self.assertTrue(self.window.remap_add.bind("<Button-1>"),
+                        "the plus has no click binding")
+        self.window.remap_add.invoke()
+        self.assertEqual(len(self.window.remap_list._rows), 1)
+
+    def test_the_remap_list_uses_the_card_width(self) -> None:
+        """It is a list, so it reads across the card instead of a control column."""
+        self.window.show_page("keyboard")
+        self.window.remap_list.add_row("CapsLock", "Escape")
+        self.window.remap_list.add_row("Menu", "LeftCtrl")
+        self.window.root.update_idletasks()
+        editor = self.window.remap_list
+        card = editor.master.master
+        self.assertGreater(editor.winfo_width(), card.winfo_width() * 0.6,
+                           "the list is squeezed into a control's column")
+        self.assertGreaterEqual(editor.winfo_height(),
+                                editor.winfo_reqheight(),
+                                "the list would be clipped")
+
+    def test_the_remap_round_trips_through_the_window(self) -> None:
+        directory = tempfile.mkdtemp(prefix="winborder_remap_")
+        path = Path(directory) / "winborder.json"
+        window = ui.SettingsWindow(StubService(), {"remap": {"CapsLock": "Escape"}},
+                                   str(path))
+        self.addCleanup(window.root.destroy)
+        window._windows_settings = config.app_settings(window.settings)
+        self.assertEqual(window.remap_list.pairs(), [("CapsLock", "Escape")])
+
+        window.remap_list.add_row("Menu", "LeftCtrl")
+        window._commit()
+        written = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(written["remap"],
+                         {"CapsLock": "Escape", "Menu": "LeftCtrl"})
 
     def test_drawn_widgets_scale_with_the_display(self) -> None:
         self.assertGreaterEqual(self.window.scale, 1.0)
@@ -594,7 +1013,7 @@ class TestLogHold(unittest.TestCase):
         directory = tempfile.mkdtemp(prefix="winborder_log_")
         try:
             self.window = ui.SettingsWindow(
-                StubService(), {"port": "COM10"},
+                StubService(), {"side": "left"},
                 str(Path(directory) / config.DEFAULT_FILENAME))
         except tk.TclError as exc:            # no display available
             self.skipTest(f"no display: {exc}")
@@ -626,6 +1045,11 @@ class TestLogHold(unittest.TestCase):
         self.window._pump_log()
         self.assertIn("the second line", self.shown())
         self.assertEqual(self.window.waiting.cget("text"), "")
+
+    def test_a_debug_line_stays_out_of_the_page(self) -> None:
+        self.log.debug("an asyncio proactor detail")
+        self.window._pump_log()
+        self.assertNotIn("proactor", self.shown())
 
     def test_nothing_is_shown_twice(self) -> None:
         self.window._toggle_pause()
@@ -746,11 +1170,22 @@ class TestWindowsSettings(unittest.TestCase):
         """Whatever the registry said before, it says again afterwards."""
         was = startup.is_enabled()
         self.addCleanup(startup.apply, was, "winborder.json")
-        if not startup.apply(True, "winborder.json"):
-            self.skipTest("cannot write the startup entry")
-        self.assertTrue(startup.is_enabled())
-        self.assertTrue(startup.apply(False, "winborder.json"))
+        # The entry is only written for the built executable, so the test says it
+        # is one: a command line pointing at this interpreter is not what ships.
+        with mock.patch.object(startup, "is_frozen", return_value=True):
+            if not startup.apply(True, "winborder.json"):
+                self.skipTest("cannot write the startup entry")
+            self.assertTrue(startup.is_enabled())
+            self.assertTrue(startup.apply(False, "winborder.json"))
         self.assertFalse(startup.is_enabled())
+
+    def test_starting_from_source_is_not_registered(self) -> None:
+        """A Run entry pointing at a Python interpreter outlives its usefulness."""
+        was = startup.is_enabled()
+        self.addCleanup(startup.apply, was, "winborder.json")
+        with mock.patch.object(startup, "is_frozen", return_value=False):
+            self.assertFalse(startup.apply(True, "winborder.json"))
+        self.assertEqual(startup.is_enabled(), was)
 
 
 class TestThemeColours(unittest.TestCase):
@@ -836,3 +1271,69 @@ class TestApplicationIcon(unittest.TestCase):
 
     def test_rgba_is_the_right_length(self) -> None:
         self.assertEqual(len(icon.rgba(32, "#4cc2ff", "#000000")), 32 * 32 * 4)
+
+
+class TestGlyphSet(unittest.TestCase):
+    """A column of icons is read as a column before it is read as icons.
+
+    The set is drawn to one specification: eleven units of ink on the centre of
+    the box. Two marks may sit off centre across, because the eye weighs their
+    ink rather than their outline -- an arrow points one way, and the joins of the
+    Bluetooth rune are both on the right.
+    """
+
+    NAMES = ("status", "gear", "edge", "bluetooth", "pointer", "keyboard",
+             "log", "terminal", "file", "reload", "quit", "pause", "play", "link")
+    DIRECTIONAL = ("pointer", "edge", "link")
+    SIZE = 32
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            cls.root = tk.Tk()
+        except tk.TclError as exc:            # no display available
+            raise unittest.SkipTest(f"no display: {exc}") from None
+        cls.root.withdraw()
+        cls.measured = {name: cls.ink(name) for name in cls.NAMES}
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.root.destroy()
+
+    @classmethod
+    def ink(cls, name: str) -> tuple[float, float, float]:
+        """Height, and the centre of the ink by weight, in the glyph's own units."""
+        image = widgets.render_icon(cls.root, name, cls.SIZE, "#ffffff",
+                                    "#000000")
+        unit = cls.SIZE / 16.0
+        total = wx = wy = 0.0
+        top, bottom = cls.SIZE, -1
+        for y in range(cls.SIZE):
+            for x in range(cls.SIZE):
+                value = image.get(x, y)
+                weight = (int(value[0]) if isinstance(value, tuple)
+                          else int(value.lstrip("#")[:2], 16))
+                if weight:
+                    total += weight
+                    wx += weight * (x + 0.5)
+                    wy += weight * (y + 0.5)
+                if weight > 12:
+                    top, bottom = min(top, y), max(bottom, y)
+        return (bottom + 1 - top) / unit, wx / total / unit, wy / total / unit
+
+    def test_every_glyph_is_the_same_height(self) -> None:
+        for name in self.NAMES:
+            height = self.measured[name][0]
+            with self.subTest(name=name):
+                self.assertAlmostEqual(height, 11.0, delta=0.7,
+                                       msg=f"{name} is {height:.1f} units tall")
+
+    def test_every_glyph_sits_on_the_centre_of_its_box(self) -> None:
+        for name in self.NAMES:
+            _height, x, y = self.measured[name]
+            with self.subTest(name=name):
+                self.assertAlmostEqual(y, 8.0, delta=0.5,
+                                       msg=f"{name} sits at {y:.2f} down")
+                if name not in self.DIRECTIONAL:
+                    self.assertAlmostEqual(x, 8.0, delta=0.5,
+                                           msg=f"{name} sits at {x:.2f} across")

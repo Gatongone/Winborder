@@ -54,7 +54,22 @@ def is_enabled() -> bool:
 
 
 def apply(start_with_windows: bool, config_path: str) -> bool:
-    """Add or remove the start with Windows entry. False when it did not work."""
+    """Add or remove the start with Windows entry. False when it did not work.
+
+    The whole footprint is one value: ``Winborder`` under the per-user Run key,
+    holding the command line above. Nothing else is written, and turning the
+    setting off deletes that one value again.
+
+    Only the built executable is registered. A command line of
+    ``pythonw -m winborder`` points at whichever interpreter happened to be
+    running, which stops working as soon as that Python moves -- and an entry
+    under Run is exactly what an antivirus is watching for, so it had better be
+    one that will still be there at the next logon.
+    """
+    if start_with_windows and not is_frozen():
+        log.warning("start with Windows needs the built executable, not a "
+                    "Python interpreter")
+        return False
     try:
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
             if start_with_windows:
@@ -88,7 +103,7 @@ def _version() -> str:
     return __version__
 
 
-def open_folder(path: str | Path) -> None:
+
     """Show a folder in Explorer."""
     folder = Path(path).resolve()
     os.startfile(folder)  # noqa: S606 - a folder the user asked to see

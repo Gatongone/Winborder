@@ -12,16 +12,16 @@ line. ``--write-config`` writes the built in defaults out as a starting point.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from dataclasses import fields
 from pathlib import Path
 
 from . import i18n, keymap, model, startup
 
-DEFAULT_FILENAME = "winborder.json"
+log = logging.getLogger("winborder.config")
 
-# Settings that describe the link rather than the routing rules.
-LINK_FIELDS = ("port", "baudrate")
+DEFAULT_FILENAME = "winborder.json"
 
 # Settings Windows owns; they live in the same file but not in the bridge config.
 APP_FIELDS = startup.APP_FIELDS
@@ -76,7 +76,7 @@ def read(path: str | Path) -> dict[str, object]:
         raise ConfigError(i18n.t("{path} must contain a JSON object").format(path=file))
 
     known = ({f.name for f in fields(model.Config)}
-             | set(LINK_FIELDS) | set(APP_FIELDS) | {LOCALE_FIELD})
+             | set(APP_FIELDS) | {LOCALE_FIELD})
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ConfigError(i18n.t("{path}: unknown setting(s): {names}").format(
@@ -91,11 +91,6 @@ def _check_extra(settings: dict[str, object], file: str | Path) -> None:
         if name in settings and not isinstance(settings[name], bool):
             raise ConfigError(i18n.t("{path}: {name} must be true or false").format(
                 path=file, name=name))
-    if "port" in settings and not isinstance(settings["port"], str):
-        raise ConfigError(i18n.t("{path}: port must be a string").format(path=file))
-    if "baudrate" in settings and (not isinstance(settings["baudrate"], int)
-                                   or isinstance(settings["baudrate"], bool)):
-        raise ConfigError(i18n.t("{path}: baudrate must be a number").format(path=file))
     if LOCALE_FIELD in settings and not i18n.is_supported(settings[LOCALE_FIELD]):
         raise ConfigError(i18n.t("{path}: language must be one of {options}").format(
             path=file, options=", ".join(i18n.codes())))
@@ -114,11 +109,6 @@ def build(settings: dict[str, object]) -> model.Config:
         raise ConfigError(str(exc)) from None
 
 
-def link_settings(settings: dict[str, object]) -> dict[str, object]:
-    """Pick out the settings that do not belong to the routing rules."""
-    return {name: settings[name] for name in LINK_FIELDS if name in settings}
-
-
 def app_settings(settings: dict[str, object]) -> dict[str, object]:
     """Pick out the settings Windows owns."""
     out = dict(startup.DEFAULTS)
@@ -132,8 +122,7 @@ def app_settings(settings: dict[str, object]) -> dict[str, object]:
 def defaults() -> dict[str, object]:
     """Every setting at its built in default, in file form."""
     config = model.Config()
-    out: dict[str, object] = {"port": "", "baudrate": 115200,
-                              LOCALE_FIELD: i18n.DEFAULT_LANGUAGE}
+    out: dict[str, object] = {LOCALE_FIELD: i18n.DEFAULT_LANGUAGE}
     out.update(startup.DEFAULTS)
     for field in fields(model.Config):
         if field.name in KEY_LIST_FIELDS:
