@@ -10,6 +10,10 @@ Move the cursor to the screen edge and the same physical keyboard and mouse driv
 
 The host is Windows only. The target may be any device that accepts a Bluetooth LE HID peripheral.
 
+## Install
+
+Get executable file or installer from [Releases Page](https://github.com/Gatongone/Winborder/releases).
+
 ## Requirements
 
 | Item | Requirement |
