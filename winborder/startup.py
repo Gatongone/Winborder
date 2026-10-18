@@ -94,7 +94,7 @@ def describe() -> dict[str, str]:
     """
     return {
         "version": _version(),
-        "runtime": "executable" if is_frozen() else f"Python {sys.version.split()[0]}",
+        "runtime": "value_executable" if is_frozen() else f"Python {sys.version.split()[0]}",
     }
 
 

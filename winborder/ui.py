@@ -64,50 +64,50 @@ class Field:
 # The text is the English source: it is translated where it is shown, so the
 # window can be built again in another language without touching this table.
 FIELDS: tuple[Field, ...] = (
-    Field("side", "Target side", "choice",
-          "Which side of the PC the target device sits on",
+    Field("side", "label_side", "choice",
+          "desc_side",
           tuple(side.value for side in model.Side)),
-    Field("sensitivity", "Pointer gain", "float",
-          "1.0 moves the target pointer as far as the PC cursor"),
-    Field("accel", "Speed gain", "float",
-          "Extra pointer gain proportional to how fast the mouse moves"),
-    Field("pullback_distance", "Damping", "int",
-          "Pull-back distance needed for control to return"),
-    Field("invert_wheel_v", "Invert vertical scroll", "bool",
-          "Vertical scrolling is reversed on the target"),
-    Field("invert_wheel_h", "Invert horizontal scroll", "bool",
-          "Horizontal scrolling is reversed on the target"),
-    Field("notch_up", "Scroll step up", "int", "Lines per wheel detent"),
-    Field("notch_down", "Scroll step down", "int", "Lines per wheel detent"),
-    Field("edge_trigger_enabled", "Cross at the screen edge", "bool",
-          "The toggle key switches this while running"),
-    Field("edge_inset", "Edge inset", "int",
-          "How close to the PC screen edge the cursor has to get"),
-    Field("exit_clear_distance", "Exit clearance", "int",
-          "How far the cursor is placed back inside the PC screen on exit"),
-    Field("enter_cooldown", "Enter cooldown", "float",
-          "Seconds before the same edge can be crossed again"),
-    Field("pullback_exit", "Return by pulling back", "bool",
-          "Pulling the pointer towards the PC returns control"),
-    Field("panic_keys", "Release control", "keys",
-          "Releases the keyboard and mouse back to the PC at once"),
-    Field("toggle_edge_keys", "Toggle edge crossing", "keys",
-          "Turns the pointer's screen crossing on or off"),
-    Field("type_clipboard_keys", "Type clipboard", "keys",
-          "Sends the PC clipboard to the target as ASCII characters"),
-    Field("forward_consumer_keys", "Forward media keys", "bool",
-          "Volume and transport keys go to the target"),
-    Field("capture_mouse_buttons", "Capture mouse buttons", "bool",
-          "Clicks go to the target while it has control"),
-    Field("start_with_windows", "Start with Windows", "bool",
-          "One value under HKCU Software\\Microsoft\\Windows\\CurrentVersion\\Run, holding the command line; nothing else is written"),
-    Field("start_hidden", "Start hidden", "bool",
-          "Open with the notification area icon only, without this window"),
-    Field("language", "Language", "choice",
-          "Language of this window",
+    Field("sensitivity", "label_sensitivity", "float",
+          "desc_sensitivity"),
+    Field("accel", "label_accel", "float",
+          "desc_accel"),
+    Field("pullback_distance", "label_pullback_distance", "int",
+          "desc_pullback_distance"),
+    Field("invert_wheel_v", "label_invert_wheel_v", "bool",
+          "desc_invert_wheel_v"),
+    Field("invert_wheel_h", "label_invert_wheel_h", "bool",
+          "desc_invert_wheel_h"),
+    Field("notch_up", "label_notch_up", "int", "desc_notch_step"),
+    Field("notch_down", "label_notch_down", "int", "desc_notch_step"),
+    Field("edge_trigger_enabled", "label_edge_trigger_enabled", "bool",
+          "desc_edge_trigger_enabled"),
+    Field("edge_inset", "label_edge_inset", "int",
+          "desc_edge_inset"),
+    Field("exit_clear_distance", "label_exit_clear_distance", "int",
+          "desc_exit_clear_distance"),
+    Field("enter_cooldown", "label_enter_cooldown", "float",
+          "desc_enter_cooldown"),
+    Field("pullback_exit", "label_pullback_exit", "bool",
+          "desc_pullback_exit"),
+    Field("panic_keys", "label_panic_keys", "keys",
+          "desc_panic_keys"),
+    Field("toggle_edge_keys", "label_toggle_edge_keys", "keys",
+          "desc_toggle_edge_keys"),
+    Field("type_clipboard_keys", "label_type_clipboard_keys", "keys",
+          "desc_type_clipboard_keys"),
+    Field("forward_consumer_keys", "label_forward_consumer_keys", "bool",
+          "desc_forward_consumer_keys"),
+    Field("capture_mouse_buttons", "label_capture_mouse_buttons", "bool",
+          "desc_capture_mouse_buttons"),
+    Field("start_with_windows", "label_start_with_windows", "bool",
+          "desc_start_with_windows"),
+    Field("start_hidden", "label_start_hidden", "bool",
+          "desc_start_hidden"),
+    Field("language", "label_language", "choice",
+          "desc_language",
           i18n.codes()),
-    Field("remap", "Remap keys", "remap",
-          "Key remapping for the target device; right-click a field to choose from the full list"),
+    Field("remap", "label_remap", "remap",
+          "desc_remap"),
 )
 
 FIELDS_BY_NAME = {field.name: field for field in FIELDS}
@@ -119,7 +119,7 @@ MUST_NOT_BE_NEGATIVE = ("accel",)
 
 # What a dropdown shows for each value it accepts. A value is what the settings
 # file holds and is never translated; only what stands for it is.
-VALUE_LABELS = {"left": "Left", "right": "Right", "top": "Top", "bottom": "Bottom"}
+VALUE_LABELS = {"left": "value_side_left", "right": "value_side_right", "top": "value_side_top", "bottom": "value_side_bottom"}
 
 
 def choice_labels(field: Field) -> tuple[str, ...]:
@@ -200,7 +200,7 @@ def link_summary(state: dict[str, object] | None, *,
         return time.strftime("%H:%M:%S", time.localtime(when))
 
     if state is None:
-        return i18n.t("not advertising yet — the Log says why")
+        return i18n.t("msg_not_advertising_yet")
 
     advertising = str(state.get("advertising") or "")
     if state.get("connected"):
@@ -208,23 +208,23 @@ def link_summary(state: dict[str, object] | None, *,
         # ABORTED and back again while a host is connected, and reporting that
         # as a fault would be wrong at the one moment things are working.
         when = since if since is not None else time.time()
-        return i18n.t("connected since {time} — the target device is subscribed").format(
+        return i18n.t("msg_connected_since_time_target_device").format(
             time=clock(when))
 
     if "aborted" in advertising and aborted_for >= ABORT_GRACE_S:
-        line = i18n.t("the advertisement was cut short — see the Log")
+        line = i18n.t("msg_advertisement_cut_short")
     elif not advertising.startswith("start"):
-        line = i18n.t("not advertising yet — the Log says why")
+        line = i18n.t("msg_not_advertising_yet")
     else:
         name = str(state.get("name") or "")
         # Only ever the name the radio reports: the computer name is a different
         # name, and a line naming the wrong one sends the reader looking for it in
         # the target's list and finding nothing.
-        line = (i18n.t("advertising as {name} — waiting for the target device to pair").format(name=name)
+        line = (i18n.t("msg_advertising_as_name_waiting_target").format(name=name)
                 if name else
-                i18n.t("advertising as a keyboard and mouse — waiting for the target device to pair"))
+                i18n.t("msg_advertising_as_keyboard_mouse_waiting"))
     if last_up is not None:
-        line += "  ·  " + i18n.t("last connected at {time}").format(
+        line += "  ·  " + i18n.t("msg_last_connected_at_time").format(
             time=clock(last_up))
     return line
 
@@ -232,33 +232,33 @@ def link_summary(state: dict[str, object] | None, *,
 # page key, title, icon, description, groups of rows
 PAGES: tuple[tuple[str, str, str, str,
                   tuple[tuple[str, tuple[tuple[str, ...], ...]], ...]], ...] = (
-    ("status", "Status", "status", "What the bridge is doing right now", ()),
-    ("generic", "Generic", "gear",
-     "Startup, maintenance and what is running",
-     (("Startup", (("start_with_windows",), ("start_hidden",))),
-      ("Interface", (("language",),)))),
+    ("status", "label_page_status", "status", "desc_page_status", ()),
+    ("generic", "label_page_generic", "gear",
+     "desc_page_generic",
+     (("label_group_startup", (("start_with_windows",), ("start_hidden",))),
+      ("label_group_interface", (("language",),)))),
     # The page is named for the screen edge the pointer crosses; the code still
     # calls the act a handoff (the service refuses one, the router hands over), and
     # the entry event is logged as one. Both halves meet here: where the target
     # sits, where the keyboard and mouse leave the PC, and how they come back.
-    ("edge", "Edge", "edge",
-     "Where the target sits, and where the keyboard and mouse change hands",
-     (("Connection", (("side",),)),
-      ("Crossing", (("edge_inset", "enter_cooldown"), ("exit_clear_distance",))),
-      ("Returning", (("pullback_distance",), ("pullback_exit",))))),
-    ("nearby", "Devices", "bluetooth",
-     "BLE devices around this PC", ()),
-    ("pointer", "Pointer", "pointer", "How mouse movement reaches the target",
-     (("Movement", (("sensitivity", "accel"),)),
-      ("Scrolling", (("notch_up", "notch_down"),
+    ("edge", "label_page_edge", "edge",
+     "desc_page_edge",
+     (("label_group_connection", (("side",),)),
+      ("label_group_crossing", (("edge_inset", "enter_cooldown"), ("exit_clear_distance",))),
+      ("label_group_returning", (("pullback_distance",), ("pullback_exit",))))),
+    ("nearby", "label_page_nearby", "bluetooth",
+     "desc_page_nearby", ()),
+    ("pointer", "label_page_pointer", "pointer", "desc_page_pointer",
+     (("label_group_movement", (("sensitivity", "accel"),)),
+      ("label_group_scrolling", (("notch_up", "notch_down"),
                      ("invert_wheel_v", "invert_wheel_h"))))),
-    ("keyboard", "Keyboard", "keyboard",
-     "Keys the PC keeps for itself, and what the target receives",
-     (("PC keys", (("panic_keys",), ("toggle_edge_keys",),
+    ("keyboard", "label_page_keyboard", "keyboard",
+     "desc_page_keyboard",
+     (("label_group_pc_keys", (("panic_keys",), ("toggle_edge_keys",),
                   ("type_clipboard_keys",))),
-      ("Target keyboard", (("capture_mouse_buttons", "forward_consumer_keys"),
+      ("label_group_target_keyboard", (("capture_mouse_buttons", "forward_consumer_keys"),
                            ("remap",))))),
-    ("log", "Log", "terminal", "Everything Winborder reports", ()),
+    ("log", "label_page_log", "terminal", "desc_page_log", ()),
 )
 
 # The master switch shown in a page header, where the page has one.
@@ -268,11 +268,11 @@ PAGE_SWITCHES = {"edge": "edge_trigger_enabled"}
 # values are made of are translated where they are written. These rows carry a
 # wider value column than a settings row: the link line names three counters.
 STATUS_ROWS: tuple[tuple[str, str, str], ...] = (
-    ("mode", "Mode", "Which side has the keyboard and mouse"),
-    ("cursor", "PC cursor", "Fraction of the PC screen"),
-    ("pointer", "Target pointer", "Fraction of the tracked surface"),
-    ("travel", "Travel", "Motion since the target was entered, negative on the way back"),
-    ("link", "Device link", "Reports the target accepted"),
+    ("mode", "label_status_mode", "desc_status_mode"),
+    ("cursor", "label_status_cursor", "desc_status_cursor"),
+    ("pointer", "label_status_pointer", "desc_status_pointer"),
+    ("travel", "label_status_travel", "desc_status_travel"),
+    ("link", "label_status_link", "desc_status_link"),
 )
 STATUS_CONTROL_WIDTH = 300
 
@@ -280,13 +280,13 @@ STATUS_CONTROL_WIDTH = 300
 # is a full path, so these rows carry a wider value column than the controls of
 # a settings card do.
 ABOUT_ROWS: tuple[tuple[str, str, str], ...] = (
-    ("version", "Version", "Shared by the window and the background service"),
-    ("runtime", "Running from", "An executable, or Python"),
-    ("developer", "Developer", "Maintainer of this project"),
-    ("repository", "Repository", "Source code and releases"),
-    ("license", "License", "Terms for use and redistribution"),
-    ("settings", "Settings file",
-     "The file on disk that holds the current configuration"),
+    ("version", "label_about_version", "desc_about_version"),
+    ("runtime", "label_about_runtime", "desc_about_runtime"),
+    ("developer", "label_about_developer", "desc_about_developer"),
+    ("repository", "label_about_repository", "desc_about_repository"),
+    ("license", "label_about_license", "desc_about_license"),
+    ("settings", "label_about_settings",
+     "desc_about_settings"),
 )
 ABOUT_CONTROL_WIDTH = 360
 
@@ -441,20 +441,20 @@ class SettingsForm:
                     number = int(text) if field.kind == "int" else float(text)
                 except ValueError:
                     raise config.ConfigError(
-                        i18n.t("{label} must be a number").format(label=label)) from None
+                        i18n.t("msg_label_must_be_number").format(label=label)) from None
                 if field.name in MUST_BE_POSITIVE and number <= 0:
                     raise config.ConfigError(
-                        i18n.t("{label} must be greater than zero").format(label=label))
+                        i18n.t("msg_label_must_be_greater_than").format(label=label))
                 if field.name in MUST_NOT_BE_NEGATIVE and number < 0:
                     raise config.ConfigError(
-                        i18n.t("{label} must not be negative").format(label=label))
+                        i18n.t("msg_label_must_not_be_negative").format(label=label))
                 out[field.name] = number
             elif field.kind == "keys":
                 names = [name.strip() for name in str(raw).split(",") if name.strip()]
                 for name in names:
                     if name not in keymap.KEY_NAMES:
                         raise config.ConfigError(
-                            i18n.t("{label}: unknown key {name}").format(
+                            i18n.t("msg_label_unknown_key_name").format(
                                 label=label, name=name))
                 out[field.name] = names
             elif field.kind == "remap":
@@ -463,12 +463,12 @@ class SettingsForm:
                     source, target = (str(part).strip() for part in entry)
                     if not source or not target:
                         raise config.ConfigError(
-                            i18n.t("{label}: every row needs a key on both sides").format(
+                            i18n.t("msg_remap_row_needs_key").format(
                                 label=label))
                     for name in (source, target):
                         if name not in keymap.KEY_NAMES:
                             raise config.ConfigError(
-                                i18n.t("{label}: unknown key {name}").format(
+                                i18n.t("msg_label_unknown_key_name").format(
                                     label=label, name=name))
                     pairs[source] = target
                 out[field.name] = pairs
@@ -572,7 +572,7 @@ class SettingsWindow:
         palette = self.palette
         self.sidebar = Sidebar(self.root, palette)
         self.sidebar.grid(row=0, column=0, sticky="ns")
-        self.sidebar.add("status", i18n.t("Status"), "status",
+        self.sidebar.add("status", i18n.t("label_page_status"), "status",
                          lambda: self.show_page("status"))
         for key, title, icon, _text, _groups in PAGES[1:]:
             self.sidebar.add(key, i18n.t(title), icon,
@@ -580,11 +580,11 @@ class SettingsWindow:
         self.sidebar.add("pause", self._bridge_label(),
                          "play" if self._bridge_paused else "pause",
                          self.toggle_bridge, bottom=True)
-        self.sidebar.add("file", i18n.t("Settings file"), "file",
+        self.sidebar.add("file", i18n.t("label_about_settings"), "file",
                          self._open_config_file, bottom=True)
-        self.sidebar.add("reload", i18n.t("Reload settings"), "reload",
+        self.sidebar.add("reload", i18n.t("label_reload_settings"), "reload",
                          self.reload, bottom=True)
-        self.sidebar.add("quit", i18n.t("Quit"), "quit", self.stop, bottom=True)
+        self.sidebar.add("quit", i18n.t("label_quit"), "quit", self.stop, bottom=True)
 
         self.content = tk.Frame(self.root, background=palette.bg)
         self.content.grid(row=0, column=1, sticky="nsew")
@@ -886,7 +886,7 @@ class SettingsWindow:
     def _about_page(self, body: tk.Frame) -> None:
         """Where things live, and what is running."""
         palette = self.palette
-        label = ThemedLabel(body, palette, i18n.t("About"), tone="muted",
+        label = ThemedLabel(body, palette, i18n.t("label_about"), tone="muted",
                             font=theme.SECTION_FONT)
         label.grid(row=self._next_row(body), column=0, sticky="w",
                    padx=self.px(26), pady=(self.px(18), self.px(6)))
@@ -930,9 +930,9 @@ class SettingsWindow:
         tools = tk.Frame(body, background=palette.bg)
         tools.grid(row=self._next_row(body), column=0, sticky="w",
                    padx=self.px(26), pady=(self.px(14), 0))
-        ttk.Button(tools, text=i18n.t("Open settings file"),
+        ttk.Button(tools, text=i18n.t("label_open_settings_file"),
                    command=lambda: self._open_path(self.config_path)).pack(side="left")
-        ttk.Button(tools, text=i18n.t("Reset to defaults"),
+        ttk.Button(tools, text=i18n.t("label_reset_defaults"),
                    command=self.reset).pack(side="left", padx=self.px(8))
         self._paintable.append(tools)
 
@@ -973,13 +973,13 @@ class SettingsWindow:
     def reset(self) -> None:
         """Put every setting back to its built in default."""
         if not messagebox.askyesno(
-                "Winborder", i18n.t("Reset every setting to its default value?"),
+                "Winborder", i18n.t("msg_reset_every_setting_its_default"),
                 parent=self.root):
             return
         self.settings = config.defaults()
         self._fill(self.settings)
         self._commit()
-        self._notify(i18n.t("Settings reset to defaults"))
+        self._notify(i18n.t("msg_settings_reset_defaults"))
 
     def _log_page(self, body: tk.Frame) -> None:
         palette = self.palette
@@ -1012,7 +1012,7 @@ class SettingsWindow:
         self.pause_button = ttk.Button(tools, text=self._pause_label(),
                                        command=self._toggle_pause)
         self.pause_button.pack(side="left")
-        ttk.Button(tools, text=i18n.t("Clear"), command=self._clear_log).pack(
+        ttk.Button(tools, text=i18n.t("label_clear"), command=self._clear_log).pack(
             side="left", padx=self.px(10))
         # Auto-scroll is a view setting rather than an action, so it sits at the
         # far end of the row, and the count of what arrived while the view was
@@ -1022,7 +1022,7 @@ class SettingsWindow:
         follow.pack(side="right")
         box = CheckBox(follow, self.scroll_var, palette, background=palette.bg)
         box.pack(side="left")
-        label = ThemedLabel(follow, palette, i18n.t("Auto-scroll"),
+        label = ThemedLabel(follow, palette, i18n.t("label_auto_scroll"),
                             font=theme.UI_FONT)
         label.configure(cursor="hand2")
         label.pack(side="left", padx=(self.px(8), 0))
@@ -1035,7 +1035,7 @@ class SettingsWindow:
         self._paintable.extend([card, tools, self.waiting])
 
     def _pause_label(self) -> str:
-        return i18n.t("Resume log") if self._paused else i18n.t("Pause log")
+        return i18n.t("label_resume_log") if self._paused else i18n.t("label_pause_log")
 
     def _toggle_pause(self) -> None:
         self._paused = not self._paused
@@ -1068,7 +1068,7 @@ class SettingsWindow:
 
         note = ThemedLabel(
             body, palette,
-            i18n.t("Nearby BLE does not include this PC"),
+            i18n.t("desc_nearby_note"),
             tone="muted", font=theme.UI_FONT_SMALL, wraplength=self.px(520))
         note.grid(row=2, column=0, sticky="ew", padx=self.px(26),
                   pady=(self.px(6), 0))
@@ -1099,7 +1099,7 @@ class SettingsWindow:
         self.scan_button = ttk.Button(tools, text=self._scan_label(),
                                       command=self._toggle_scan)
         self.scan_button.pack(side="left")
-        ttk.Button(tools, text=i18n.t("Clear"),
+        ttk.Button(tools, text=i18n.t("label_clear"),
                    command=self._clear_nearby).pack(side="left", padx=self.px(10))
         self._paintable.extend([self.link_state, note, card, tools])
         # Wrap both lines of text to the width the list card has: it spans the
@@ -1139,7 +1139,7 @@ class SettingsWindow:
 
 
     def _scan_label(self) -> str:
-        return i18n.t("Stop scanning") if self._scanner.running else i18n.t("Scan")
+        return i18n.t("label_stop_scanning") if self._scanner.running else i18n.t("label_scan")
 
     def _toggle_scan(self) -> None:
         if self._scanner.running:
@@ -1167,10 +1167,10 @@ class SettingsWindow:
         for device in seen:
             services = ",".join(device.services[:4])
             lines.append(f"  {device.rssi:5} dBm  {device.address}  "
-                         f"{device.name or i18n.t("unnamed")}"
+                         f"{device.name or i18n.t("value_unnamed")}"
                          f"{'  ' + services if services else ''}")
         if not lines:
-            lines = ["  " + i18n.t("No devices seen yet")]
+            lines = ["  " + i18n.t("msg_no_devices_seen_yet")]
         self.nearby_text.configure(state="normal")
         self.nearby_text.delete("1.0", "end")
         self.nearby_text.insert("end", "\n".join(lines) + "\n")
@@ -1187,7 +1187,7 @@ class SettingsWindow:
 
     def _bridge_label(self) -> str:
         """What the sidebar and the tray call holding the bridge still."""
-        return i18n.t("Resume") if self._bridge_paused else i18n.t("Pause")
+        return i18n.t("label_resume") if self._bridge_paused else i18n.t("label_pause")
 
     def toggle_bridge(self) -> None:
         """Hold the bridge still, or let it go again.
@@ -1199,7 +1199,7 @@ class SettingsWindow:
         self.service.set_paused(self._bridge_paused)
         self.sidebar.items["pause"].set_text(
             self._bridge_label(), "play" if self._bridge_paused else "pause")
-        self._notify(i18n.t("Paused") if self._bridge_paused else i18n.t("Running"))
+        self._notify(i18n.t("value_paused") if self._bridge_paused else i18n.t("value_running"))
 
     @staticmethod
     def _next_row(frame: tk.Widget) -> int:
@@ -1294,10 +1294,10 @@ class SettingsWindow:
         try:
             config.write(self.config_path, settings)
         except OSError as exc:
-            self._notify(i18n.t("Cannot write {path}: {error}").format(
+            self._notify(i18n.t("msg_cannot_write_banner").format(
                 path=self.config_path, error=exc), error=True)
             return
-        self._notify(i18n.t("Saved"))
+        self._notify(i18n.t("msg_saved"))
 
     def _apply_windows_settings(self, settings: dict[str, object]) -> None:
         """Push the settings Windows owns, once they have changed."""
@@ -1306,7 +1306,7 @@ class SettingsWindow:
             return
         self._windows_settings = app
         if not startup.apply(bool(app["start_with_windows"]), self.config_path):
-            self._notify(i18n.t("Could not change the startup entry"), error=True)
+            self._notify(i18n.t("msg_could_not_change_startup_entry"), error=True)
 
     def reload(self) -> None:
         try:
@@ -1317,7 +1317,7 @@ class SettingsWindow:
         self.settings = settings
         self._fill(settings)
         self.service.apply_config(config.build(settings))
-        self._notify(i18n.t("Reloaded {path}").format(path=self.config_path))
+        self._notify(i18n.t("msg_reloaded_path").format(path=self.config_path))
 
     def hide(self) -> None:
         self.root.withdraw()
@@ -1433,17 +1433,17 @@ class SettingsWindow:
         outcome = self.service.type_clipboard()
         result = outcome["result"]
         if result == "empty":
-            self._notify(i18n.t("The clipboard holds no text this layout can type"),
+            self._notify(i18n.t("msg_clipboard_holds_no_text_this"),
                          error=True)
         elif result == "no_target":
-            self._notify(i18n.t("The target is not connected"), error=True)
+            self._notify(i18n.t("msg_target_not_connected"), error=True)
         elif result == "paused":
-            self._notify(i18n.t("The bridge is paused"), error=True)
+            self._notify(i18n.t("msg_bridge_paused"), error=True)
         elif outcome["skipped"]:
-            self._notify(i18n.t("Typing {count} characters, {skipped} left out").format(
+            self._notify(i18n.t("msg_typing_count_characters_skipped_left").format(
                 count=outcome["keys"], skipped=outcome["skipped"]))
         else:
-            self._notify(i18n.t("Typing {count} characters").format(
+            self._notify(i18n.t("msg_typing_count_characters").format(
                 count=outcome["keys"]))
 
     def _run_service(self) -> None:
@@ -1501,7 +1501,7 @@ class SettingsWindow:
     def _show_waiting(self) -> None:
         """Say how much has arrived while the view was held still."""
         self.waiting.configure(
-            text=i18n.t("{count} new lines").format(count=self._waiting)
+            text=i18n.t("msg_count_new_lines").format(count=self._waiting)
             if self._paused and self._waiting else "")
 
     def _pump_status(self) -> None:
@@ -1513,11 +1513,11 @@ class SettingsWindow:
         if state is not None and hasattr(self, "status_rows"):
             cursor = state["cursor"]
             pointer = state["pointer"]
-            mode = i18n.t("target" if state["mode"] == "target" else "pc")
+            mode = i18n.t("value_target" if state["mode"] == "target" else "value_pc")
             if state.get("paused"):
-                mode = i18n.t("Paused")
-            link = i18n.t("up" if state["connected"] else "down")
-            written, bad = i18n.t("written"), i18n.t("bad")
+                mode = i18n.t("value_paused")
+            link = i18n.t("value_up" if state["connected"] else "value_down")
+            written, bad = i18n.t("value_written"), i18n.t("value_bad")
             self.status_rows["mode"].configure(text=mode)
             self.status_rows["cursor"].configure(
                 text=f"({cursor[0]:.3f}, {cursor[1]:.3f})")

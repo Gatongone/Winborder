@@ -25,8 +25,9 @@ CALL = re.compile(r"i18n\.t\(\s*\"((?:[^\"\\]|\\.)*)\"\s*\)")
 # Text that reaches the translator through a variable rather than a literal, so
 # the scan above cannot see it.
 INDIRECT = set(ui.VALUE_LABELS.values()) | {
-    "pc", "target", "up", "down", "written", "bad",     # the status values
-    "executable",                                       # startup.describe
+    "value_pc", "value_target", "value_up", "value_down", "value_written",
+    "value_bad",                                         # the status values
+    "value_executable",                                  # startup.describe
 }
 
 
@@ -67,6 +68,18 @@ class TestTables(unittest.TestCase):
                 else:
                     self.assertIn(code, i18n.TRANSLATIONS)
 
+    def test_every_table_is_a_file_in_the_package(self) -> None:
+        """The tables are data, so a package that forgets them is silent English."""
+        for code in i18n.codes():
+            if code == i18n.DEFAULT_LANGUAGE:
+                continue
+            with self.subTest(code=code):
+                path = i18n.LOCALES / f"{code}.json"
+                self.assertTrue(path.exists(), f"{path} is missing")
+                table = i18n.TRANSLATIONS[code]
+                self.assertTrue(table, f"{code} loaded nothing")
+                self.assertEqual(len(table), len(i18n.TRANSLATIONS["zh"]))
+
     def test_every_language_translates_the_same_strings(self) -> None:
         reference = set(i18n.TRANSLATIONS["zh"])
         for code, table in i18n.TRANSLATIONS.items():
@@ -83,12 +96,13 @@ class TestTables(unittest.TestCase):
     def test_placeholders_survive_translation(self) -> None:
         """A message is formatted after it is translated."""
         for code, table in i18n.TRANSLATIONS.items():
-            for source, text in table.items():
+            for key, text in table.items():
+                source = i18n.ENGLISH.get(key, key)
                 wanted = set(re.findall(r"\{(\w+)", source))
                 got = set(re.findall(r"\{(\w+)", text))
                 if not wanted:
                     continue
-                with self.subTest(code=code, source=source):
+                with self.subTest(code=code, key=key):
                     self.assertEqual(got, wanted,
                                      "the translated message names other fields")
 
@@ -101,13 +115,14 @@ class TestTables(unittest.TestCase):
         pointed at opposite ends of the link.
         """
         for code, table in i18n.TRANSLATIONS.items():
-            for source, text in table.items():
-                with self.subTest(code=code, source=source):
+            for key, text in table.items():
+                source = i18n.ENGLISH.get(key, key)
+                with self.subTest(code=code, key=key):
                     self.assertNotIn("host", source.lower(),
                                      "the PC is the PC and the other side is the "
                                      "target device; host names both")
                     if code == "zh":
-                        for word in ("主机", "本机", "这个"):
+                        for word in ("PC", "光标", "本机", "这个"):
                             self.assertNotIn(word, text)
 
     def test_every_description_starts_with_a_capital(self) -> None:
@@ -128,11 +143,12 @@ class TestTables(unittest.TestCase):
         for rows in (ui.STATUS_ROWS, ui.ABOUT_ROWS):
             for _key, title, description in rows:
                 texts.update((title, description))
-        for text in texts:
-            with self.subTest(text=text):
+        for key in texts:
+            with self.subTest(key=key):
+                text = i18n.ENGLISH.get(key, key)
                 self.assertTrue(text[:1].isupper() or not text[:1].isalpha(),
                                 "a description starts with a capital letter")
-                translated = i18n.TRANSLATIONS["ru"].get(text, "")
+                translated = i18n.TRANSLATIONS["ru"].get(key, "")
                 self.assertTrue(translated[:1].isupper()
                                 or not translated[:1].isalpha(),
                                 f"ru: {translated}")
@@ -158,18 +174,18 @@ class TestLookup(unittest.TestCase):
     def tearDown(self) -> None:
         i18n.set_language(i18n.DEFAULT_LANGUAGE)
 
-    def test_english_needs_no_table(self) -> None:
+    def test_english_comes_from_its_own_file(self) -> None:
         i18n.set_language("en")
-        self.assertEqual(i18n.t("Status"), "Status")
+        self.assertEqual(i18n.t("label_page_status"), "Status")
 
     def test_a_translation_is_used(self) -> None:
         i18n.set_language("ja")
-        self.assertEqual(i18n.t("Status"), "状態")
+        self.assertEqual(i18n.t("label_page_status"), "状態")
 
-    def test_unknown_text_is_returned_unchanged(self) -> None:
+    def test_a_key_no_table_carries_is_returned_unchanged(self) -> None:
+        """A half-finished rename shows up as the key, not as an empty label."""
         i18n.set_language("ko")
-        self.assertEqual(i18n.t("not a string of this window"),
-                         "not a string of this window")
+        self.assertEqual(i18n.t("label_not_a_key"), "label_not_a_key")
 
     def test_an_unknown_language_leaves_english(self) -> None:
         self.assertEqual(i18n.set_language("klingon"), i18n.DEFAULT_LANGUAGE)
@@ -205,9 +221,11 @@ class TestChoiceLabels(unittest.TestCase):
         field = ui.FIELDS_BY_NAME["side"]
         i18n.set_language("zh")
         self.assertEqual(ui.choice_labels(field),
-                         tuple(i18n.t(word) for word in ("Left", "Right", "Top",
-                                                         "Bottom")))
-        self.assertEqual(ui.choice_value(field, i18n.t("Bottom")), "bottom")
+                         tuple(i18n.t(key) for key in (
+                             "value_side_left", "value_side_right",
+                             "value_side_top", "value_side_bottom")))
+        self.assertEqual(ui.choice_value(field, i18n.t("value_side_bottom")),
+                         "bottom")
 
     def test_the_language_names_are_native_in_every_language(self) -> None:
         field = ui.FIELDS_BY_NAME[config.LOCALE_FIELD]
@@ -325,12 +343,16 @@ class TestConsoleStrings(unittest.TestCase):
         self.addCleanup(i18n.set_language, i18n.DEFAULT_LANGUAGE)
         source = textwrap.dedent(
             Path(cli.__file__).read_text(encoding="utf-8"))
-        self.assertIn('i18n.t("settings file not found: {path}")', source)
+        self.assertIn('i18n.t("msg_settings_file_not_found_path")', source)
 
     def test_the_startup_facts_are_translated(self) -> None:
         facts = startup.describe()
         self.assertEqual(set(facts), {"version", "runtime"})
-        self.assertEqual(facts["runtime"], i18n.t(facts["runtime"]))
+        # From source it runs under Python, which is a fact and not a translation;
+        # from the built executable the value is a key the tables carry.
+        self.assertTrue(facts["runtime"].startswith("Python")
+                        or facts["runtime"] in i18n.ENGLISH)
+        self.assertIn("value_executable", i18n.ENGLISH)
 
 
 class StubService:
@@ -378,9 +400,9 @@ class TestLanguageSwitch(unittest.TestCase):
         self.choose("ja")
         self.assertEqual(i18n.language(), "ja")
         self.assertEqual(self.window.sidebar.items["generic"].label.cget("text"),
-                         i18n.TRANSLATIONS["ja"]["Generic"])
+                         i18n.TRANSLATIONS["ja"]["label_page_generic"])
         self.assertEqual(self.window.message.cget("text"),
-                         i18n.TRANSLATIONS["ja"]["Saved"])
+                         i18n.TRANSLATIONS["ja"]["msg_saved"])
 
     def test_the_choice_is_written_down(self) -> None:
         self.choose("ko")

@@ -106,6 +106,9 @@ def main() -> int:
         "--paths", str(ROOT),
         "--hidden-import", "winborder.ui",
         "--hidden-import", "winborder.tray",
+        # The translation tables are data files, not modules: without this the
+        # window is built in English and says so in the log.
+        "--add-data", f"{ROOT / 'winborder' / 'locales'}{os.pathsep}winborder/locales",
         "--onefile" if not args.onedir else "--onedir",
         "--windowed" if not args.console else "--console",
         str(ENTRY),

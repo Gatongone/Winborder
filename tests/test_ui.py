@@ -413,7 +413,7 @@ class TestKeyField(unittest.TestCase):
         return widgets.KeyField(self.root, self.palette, value)
 
     def test_it_asks_for_a_key_when_it_is_empty(self) -> None:
-        self.assertEqual(self.field().cget("text"), i18n.t("Press a key"))
+        self.assertEqual(self.field().cget("text"), i18n.t("label_press_key"))
 
     def test_pressing_a_key_names_it(self) -> None:
         field = self.field()
@@ -960,7 +960,7 @@ class TestWindowLayout(unittest.TestCase):
         self.window._closing = True              # one pass of the pump
         self.window._pump_status()
         self.assertEqual(self.window.status_rows["mode"].cget("text"),
-                         i18n.t("Paused"))
+                         i18n.t("value_paused"))
 
     def test_the_devices_page_says_what_the_link_is_doing(self) -> None:
         self.window._closing = True

@@ -664,7 +664,7 @@ class KeyPicker(tk.Toplevel):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
         self.query = tk.StringVar()
-        prompt = tk.Label(self, text=i18n.t("Search keys"), anchor="w",
+        prompt = tk.Label(self, text=i18n.t("label_search_keys"), anchor="w",
                           font=theme.UI_FONT_SMALL, background=palette.surface,
                           foreground=palette.muted)
         prompt.grid(row=0, column=0, sticky="ew", padx=scaled(8),
@@ -779,7 +779,7 @@ class KeyField(ttk.Button):
         self.bind("<Button-3>", lambda _event: self.pick())
 
     def _label(self) -> str:
-        return self.value or i18n.t("Press a key")
+        return self.value or i18n.t("label_press_key")
 
     def _show(self) -> None:
         """Draw the label, and size the button to it.
@@ -790,7 +790,7 @@ class KeyField(ttk.Button):
         """
         label = self._label()
         key_width = len(label) + 2
-        # "Press a key" is a prompt, not a key: it needs the room to be read.
+        # "label_press_key" is a prompt, not a key: it needs the room to be read.
         self.configure(text=label,
                        width=max(6, key_width) if self.value else 14)
 
@@ -926,7 +926,7 @@ class RemapList(tk.Frame):
 
         self.lines = tk.Frame(self, background=palette.surface)
         self.lines.grid(row=0, column=0, sticky="ew")
-        self.empty = tk.Label(self, text=i18n.t("No keys remapped"),
+        self.empty = tk.Label(self, text=i18n.t("msg_no_keys_remapped"),
                               font=theme.UI_FONT_SMALL, anchor="w",
                               background=palette.surface,
                               foreground=palette.muted)
@@ -943,7 +943,7 @@ class RemapList(tk.Frame):
         source_field = KeyField(line, self.palette, source,
                                 on_change=self._changed, width=self.NAME_WIDTH)
         source_field.pack(side="left")
-        tk.Label(line, text=i18n.t("to"), font=theme.UI_FONT_SMALL,
+        tk.Label(line, text=i18n.t("label_remap_to"), font=theme.UI_FONT_SMALL,
                  background=self.palette.surface,
                  foreground=self.palette.muted).pack(side="left",
                                                     padx=scaled(10))

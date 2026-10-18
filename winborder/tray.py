@@ -302,21 +302,21 @@ class TrayIcon:
                 paused = bool(self._paused is not None and self._paused())
                 _u32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if paused else 0),
                                  self.MENU_PAUSE,
-                                 i18n.t("Resume") if paused else i18n.t("Pause"))
+                                 i18n.t("label_resume") if paused else i18n.t("label_pause"))
                 _u32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
             _u32.AppendMenuW(menu, MF_STRING, self.MENU_OPEN,
-                             i18n.t("Open settings"))
+                             i18n.t("label_open_settings"))
             if self._on_type_clipboard is not None:
                 _u32.AppendMenuW(menu, MF_STRING, self.MENU_TYPE,
-                                 i18n.t("Type clipboard text"))
+                                 i18n.t("label_type_clipboard_text"))
             if self._on_reload is not None:
                 _u32.AppendMenuW(menu, MF_STRING, self.MENU_RELOAD,
-                                 i18n.t("Reload settings"))
+                                 i18n.t("label_reload_settings"))
             if self._on_open_config is not None:
                 _u32.AppendMenuW(menu, MF_STRING, self.MENU_CONFIG,
-                                 i18n.t("Open settings file"))
+                                 i18n.t("label_open_settings_file"))
             _u32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-            _u32.AppendMenuW(menu, MF_STRING, self.MENU_QUIT, i18n.t("Quit"))
+            _u32.AppendMenuW(menu, MF_STRING, self.MENU_QUIT, i18n.t("label_quit"))
             point = wintypes.POINT()
             _u32.GetCursorPos(ctypes.byref(point))
             _u32.SetForegroundWindow(self._hwnd)

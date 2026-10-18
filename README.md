@@ -43,16 +43,6 @@ Then run from the source tree with `python -m winborder`, or use a release build
 
 If it works, move your mouse to the bottom of the screen, and the cursor will pass through the screen onto your device.
 
-### Gestures
-
-| Gesture | Action |
-| --- | --- |
-| Move the cursor to the screen edge | Enter target mode |
-| F1 | Release control immediately |
-| F2 | Enable or disable edge crossing |
-| Double Ctrl | Return to the PC |
-| Ctrl + C (console) | Quit |
-
 ### Settings
 
 Everything the host does without a command line flag comes from `winborder.json` beside the executable, or in the working directory when run from the source tree. Write one out and edit it:

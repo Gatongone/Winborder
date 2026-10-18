@@ -79,7 +79,7 @@ def load_settings(args: argparse.Namespace) -> dict[str, object]:
     if not Path(args.config).exists():
         if args.config != config_mod.default_path():
             raise config_mod.ConfigError(
-                i18n.t("settings file not found: {path}").format(path=args.config))
+                i18n.t("msg_settings_file_not_found_path").format(path=args.config))
         return {}
     settings = config_mod.read(args.config)
     log.info("settings from %s", args.config)
@@ -139,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             written = config_mod.write_default(args.write_config)
         except OSError as exc:
-            return _fail(i18n.t("cannot write {path}: {error}").format(
+            return _fail(i18n.t("msg_cannot_write_log").format(
                 path=args.write_config, error=exc))
         print(f"wrote {written}")
         return 0

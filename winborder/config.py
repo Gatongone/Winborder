@@ -66,20 +66,20 @@ def read(path: str | Path) -> dict[str, object]:
     """Read and validate a settings file. Missing file yields no settings."""
     file = Path(path)
     if not file.exists():
-        raise ConfigError(i18n.t("settings file not found: {path}").format(path=file))
+        raise ConfigError(i18n.t("msg_settings_file_not_found_path").format(path=file))
     try:
         raw = json.loads(file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ConfigError(i18n.t("{path} is not valid JSON: {error}").format(
+        raise ConfigError(i18n.t("msg_path_not_valid_json_error").format(
             path=file, error=exc)) from None
     if not isinstance(raw, dict):
-        raise ConfigError(i18n.t("{path} must contain a JSON object").format(path=file))
+        raise ConfigError(i18n.t("msg_path_must_contain_json_object").format(path=file))
 
     known = ({f.name for f in fields(model.Config)}
              | set(APP_FIELDS) | {LOCALE_FIELD})
     unknown = sorted(set(raw) - known)
     if unknown:
-        raise ConfigError(i18n.t("{path}: unknown setting(s): {names}").format(
+        raise ConfigError(i18n.t("msg_path_unknown_setting_s_names").format(
             path=file, names=", ".join(unknown)))
     _check_extra(raw, file)
     return raw
@@ -89,10 +89,10 @@ def _check_extra(settings: dict[str, object], file: str | Path) -> None:
     """Type check the settings that are not part of the bridge config."""
     for name in APP_FIELDS:
         if name in settings and not isinstance(settings[name], bool):
-            raise ConfigError(i18n.t("{path}: {name} must be true or false").format(
+            raise ConfigError(i18n.t("msg_path_name_must_be_true").format(
                 path=file, name=name))
     if LOCALE_FIELD in settings and not i18n.is_supported(settings[LOCALE_FIELD]):
-        raise ConfigError(i18n.t("{path}: language must be one of {options}").format(
+        raise ConfigError(i18n.t("msg_path_language_must_be_one").format(
             path=file, options=", ".join(i18n.codes())))
 
 
@@ -171,19 +171,19 @@ def _remap_in_file_form(value: object) -> dict[str, str]:
     if isinstance(value, (tuple, list)):
         return {keymap.describe_vk(vk): keymap.describe_usage(usage)
                 for vk, usage in value}                   # type: ignore[misc]
-    raise ConfigError(i18n.t("remap must be an object of {from: to} key names"))
+    raise ConfigError(i18n.t("msg_remap_must_be_object_from"))
 
 
 def _coerce(name: str, kind: str, value: object) -> object:
     if name == "side":
         if not isinstance(value, str):
-            raise ConfigError(i18n.t("side must be a string, got {kind}").format(
+            raise ConfigError(i18n.t("msg_side_must_be_string_got").format(
                 kind=type(value).__name__))
         try:
             return model.Side(value)
         except ValueError:
             options = ", ".join(side.value for side in model.Side)
-            raise ConfigError(i18n.t("side must be one of {options}, got {value}")
+            raise ConfigError(i18n.t("msg_side_must_be_one_options")
                               .format(options=options, value=repr(value))) from None
     if name in KEY_LIST_FIELDS:
         return _key_tuple(name, value)
@@ -191,27 +191,27 @@ def _coerce(name: str, kind: str, value: object) -> object:
         return _remap(value)
     if kind == "bool":
         if not isinstance(value, bool):
-            raise ConfigError(i18n.t("{name} must be true or false").format(name=name))
+            raise ConfigError(i18n.t("msg_name_must_be_true_false").format(name=name))
         return value
     if kind == "int":
         if not isinstance(value, int) or isinstance(value, bool):
-            raise ConfigError(i18n.t("{name} must be a number").format(name=name))
+            raise ConfigError(i18n.t("msg_name_must_be_number").format(name=name))
         return value
     if kind == "float":
         if not isinstance(value, (int, float)) or isinstance(value, bool):
-            raise ConfigError(i18n.t("{name} must be a number").format(name=name))
+            raise ConfigError(i18n.t("msg_name_must_be_number").format(name=name))
         return float(value)
-    raise ConfigError(i18n.t("{name} cannot be set from the settings file")
+    raise ConfigError(i18n.t("msg_name_cannot_be_set_from")
                       .format(name=name))
 
 
 def _key_tuple(name: str, value: object) -> tuple[int, ...]:
     if not isinstance(value, list):
-        raise ConfigError(i18n.t("{name} must be a list of key names").format(name=name))
+        raise ConfigError(i18n.t("msg_name_must_be_list_key").format(name=name))
     keys = []
     for entry in value:
         if not isinstance(entry, str):
-            raise ConfigError(i18n.t("{name} must be a list of key names")
+            raise ConfigError(i18n.t("msg_name_must_be_list_key")
                               .format(name=name))
         try:
             keys.append(keymap.vk_from_name(entry))
@@ -222,11 +222,11 @@ def _key_tuple(name: str, value: object) -> tuple[int, ...]:
 
 def _remap(value: object) -> tuple[tuple[int, int], ...]:
     if not isinstance(value, dict):
-        raise ConfigError(i18n.t("remap must be an object of {from: to} key names"))
+        raise ConfigError(i18n.t("msg_remap_must_be_object_from"))
     pairs = []
     for source, target in value.items():
         if not isinstance(target, str):
-            raise ConfigError(i18n.t("remap values must be key names"))
+            raise ConfigError(i18n.t("msg_remap_values_must_be_key"))
         try:
             pairs.append((keymap.vk_from_name(source), keymap.usage_from_name(target)))
         except ValueError as exc:
