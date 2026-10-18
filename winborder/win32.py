@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import time
 from ctypes import wintypes
 
 log = logging.getLogger("winborder.win32")
@@ -38,6 +39,11 @@ WM_INPUT = 0x00FF
 WM_QUIT = 0x0012
 
 PM_REMOVE = 0x0001
+
+#: Handles of the clipboard: the text format, and how long to wait for it.
+CF_UNICODETEXT = 13
+CLIPBOARD_RETRIES = 5
+CLIPBOARD_RETRY_S = 0.02
 
 XBUTTON1 = 0x0001
 XBUTTON2 = 0x0002
@@ -338,6 +344,54 @@ def bluetooth_name() -> str:
         return info.szName
     finally:
         close(finder)
+
+
+def read_clipboard_text() -> str:
+    """The clipboard's text, or "" when it holds none.
+
+    The clipboard is shared with every other program on the desktop and one of
+    them can hold it open at the moment it is read, so a few short retries come
+    before the empty answer. Empty is not a fault: a clipboard holding a picture,
+    or nothing at all, is an ordinary state and the caller says which it found.
+    """
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+    user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    kernel32.GlobalLock.argtypes = [wintypes.HANDLE]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+
+    for _attempt in range(CLIPBOARD_RETRIES):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(CLIPBOARD_RETRY_S)
+    else:
+        log.debug("the clipboard stayed open in another program")
+        return ""
+
+    try:
+        if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            return ""
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            return ""
+        try:
+            return ctypes.wstring_at(pointer)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
 
 
 def focus_window(title: str) -> bool:

@@ -175,3 +175,65 @@ class TestConnect(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StubLink:
+    """The link as the typing path sees it: something to count accepted reports."""
+
+    def __init__(self) -> None:
+        self.written_frames = 0
+
+
+class TestTypingRequest(unittest.TestCase):
+    """Clipboard text is planned on the caller's thread and typed by the step.
+
+    Reading the clipboard can wait, so it does not happen on the thread that has
+    to keep the reports going; the plan is what crosses over.
+    """
+
+    def setUp(self) -> None:
+        self.service = Service()
+        self.sink = StubSink()
+        self.service._sink = self.sink
+        self.service._link = StubLink()
+
+    def request(self, text: str) -> None:
+        with mock.patch.object(service_mod.win32, "read_clipboard_text",
+                               return_value=text):
+            self.service.type_clipboard()
+
+    def test_the_clipboard_is_planned_before_the_step_runs(self) -> None:
+        self.request("Hi")
+        self.assertEqual(len(self.service._typing_planned.strokes), 2)
+        self.assertEqual(self.service.router.typing(), 0,
+                         "the caller does not touch the router")
+
+    def test_the_step_hands_the_plan_to_the_router(self) -> None:
+        self.request("Hi")
+        self.service._apply_typing()
+        self.assertEqual(self.service.router.typing(), 2)
+        self.assertIsNone(self.service._typing_planned, "the request is used once")
+
+    def test_the_clipboard_key_note_queues_the_clipboard(self) -> None:
+        with mock.patch.object(service_mod.win32, "read_clipboard_text",
+                              return_value="Hi"):
+            self.service._on_note("type_requested")
+        self.assertIsNotNone(self.service._typing_planned)
+        self.service._apply_typing()
+        self.assertEqual(self.service.router.typing(), 2)
+
+    def test_nothing_is_typed_without_a_link(self) -> None:
+        self.service._link = None
+        self.request("Hi")
+        self.service._apply_typing()
+        self.assertEqual(self.service.router.typing(), 0)
+
+    def test_an_empty_clipboard_queues_nothing(self) -> None:
+        self.request("")
+        self.service._apply_typing()
+        self.assertEqual(self.service.router.typing(), 0)
+
+    def test_text_with_nothing_typable_queues_nothing(self) -> None:
+        self.request("中文")
+        self.service._apply_typing()
+        self.assertEqual(self.service.router.typing(), 0)

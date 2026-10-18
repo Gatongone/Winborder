@@ -30,7 +30,7 @@ APP_FIELDS = startup.APP_FIELDS
 LOCALE_FIELD = "language"
 
 # Fields whose JSON form is not the field value itself.
-KEY_LIST_FIELDS = ("panic_keys", "toggle_edge_keys")
+KEY_LIST_FIELDS = ("panic_keys", "toggle_edge_keys", "type_clipboard_keys")
 REMAP_FIELD = "remap"
 
 

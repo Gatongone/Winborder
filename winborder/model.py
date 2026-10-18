@@ -16,12 +16,19 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Sequence
 
-from . import hid, keymap
+from . import hid, keymap, keystrokes
 
 PENDING_MOVE_CAP = 2000.0
 HID_STEP_LIMIT = 127
 LINK_SILENCE_TIMEOUT_S = 1.5
 REPORT_INTERVAL_S = 1.0 / 90.0
+
+# How a queued keystroke is timed: the target sees the key held for the hold, then
+# released, and the next key comes after the interval. Twelve milliseconds per
+# character is a typing speed a person cannot reach but a keyboard can, and it
+# leaves the target time to act on each report.
+STROKE_HOLD_S = 0.006
+STROKE_INTERVAL_S = 0.012
 
 # How long the bridge stays deaf to the screen edge after being resumed, so that
 # resuming with the cursor already resting against the edge does not hand control
@@ -72,6 +79,8 @@ class Config:
     # gesture.
     pullback_distance: int = 300
     panic_keys: tuple[int, ...] = (0x70,)
+    #: Pressed while the target has control: the clipboard is typed into it.
+    type_clipboard_keys: tuple[int, ...] = (0x72,)
     toggle_edge_keys: tuple[int, ...] = (0x71,)
     notch_up: int = 3
     notch_down: int = 3
@@ -86,6 +95,10 @@ class Config:
             raise ValueError("enter_cooldown must not be negative")
         if self.pullback_distance < 0:
             raise ValueError("pullback_distance must not be negative")
+        if self.sensitivity <= 0.0:
+            raise ValueError("sensitivity must be greater than zero")
+        if self.accel < 0.0:
+            raise ValueError("accel must not be negative")
 
 
 @dataclass(frozen=True)
@@ -244,6 +257,11 @@ class Router:
         self._last_tx_ok: float | None = None
         self._link_lost = False
 
+        # Queued keystrokes, and where the queue is in its press/release cycle.
+        self._typing: list[keystrokes.Stroke] = []
+        self._typing_next_at = 0.0
+        self._typing_held = False
+
     # -- geometry ---------------------------------------------------------
 
     def set_config(self, config: Config) -> None:
@@ -338,6 +356,10 @@ class Router:
             return []
         self.paused = bool(paused)
         if self.paused:
+            # Queued text is dropped rather than held: it was meant for the target
+            # the moment it was asked for, and a pause is not a wait.
+            self._typing.clear()
+            self._typing_held = False
             if self.mode is Mode.TARGET:
                 return self.leave_target("paused", now, lock_reentry=True)
             return [Notify("paused")]
@@ -358,6 +380,8 @@ class Router:
 
     def reset_device_state(self) -> list[Effect]:
         self.keyboard.clear()
+        self._typing.clear()
+        self._typing_held = False
         self.buttons = 0
         self.consumer = 0
         self._pending_dx = self._pending_dy = 0.0
@@ -408,6 +432,8 @@ class Router:
         self.mode = Mode.PC
         self.stats.exited += 1
         self.keyboard.clear()
+        self._typing.clear()
+        self._typing_held = False
         self.buttons = 0
         self.consumer = 0
         self._pending_dx = self._pending_dy = 0.0
@@ -488,6 +514,11 @@ class Router:
         for event in events:
             if isinstance(event, KeyPress):
                 self.stats.keys += 1
+                if event.down and self._typing:
+                    # A real key is the user taking the keyboard back: the rest of
+                    # the queue would type over whatever that key does.
+                    effects += self._cancel_typing()
+                    effects.append(Notify("typing_cancelled"))
                 effects += self._on_key(event, now)
             elif isinstance(event, MouseMove):
                 self.stats.moves += 1
@@ -498,6 +529,7 @@ class Router:
             elif isinstance(event, MouseWheel):
                 self.stats.wheels += 1
                 effects += self._on_wheel(event)
+        effects += self._typing_step(now)
         effects += self._maybe_report(now)
         if (self.mode is Mode.TARGET and self._last_tx_ok is not None
                 and now - self._last_tx_ok > LINK_SILENCE_TIMEOUT_S):
@@ -621,6 +653,12 @@ class Router:
                                     edge_trigger_enabled=not self.cfg.edge_trigger_enabled)
                 return [Notify(
                     f"edge_trigger:{'on' if self.cfg.edge_trigger_enabled else 'off'}")]
+            if (event.vk in self.cfg.type_clipboard_keys
+                    and self.mode is Mode.TARGET):
+                # The key is swallowed: it is a request to the host, not something
+                # the target has any use for. Nothing is read here -- the router has
+                # no I/O, so the service answers the note with the clipboard.
+                return [Notify("type_requested")]
 
         if self.mode is Mode.PC:
             return []
@@ -682,6 +720,62 @@ class Router:
             return
         if self.cfg.forward_consumer_keys and vk in keymap.VK_TO_CONSUMER:
             self.consumer = keymap.VK_TO_CONSUMER[vk] if event.down else 0
+
+    # -- typing -----------------------------------------------------------
+
+    def type_text(self, plan: keystrokes.Plan) -> str:
+        """Queue text to be typed into the target, and say whether it was taken.
+
+        A keyboard report is a key state and not a character, so this cannot be
+        one frame: the plan is played out at the pace in ``STROKE_*_S``, a press
+        and a release per character. A second request while one is playing is
+        refused rather than interleaved, and so is one that arrives while the user
+        is holding keys: the report carries only one state, so typing over a held
+        key would let go of it.
+        """
+        if not plan.strokes:
+            return "empty"
+        if self._typing or self._typing_held:
+            return "busy"
+        if self.keyboard.keys or self.keyboard.modifiers:
+            return "keys_held"
+        self._typing = list(plan.strokes)
+        self._typing_next_at = 0.0
+        self._typing_held = False
+        return "queued"
+
+    def typing(self) -> int:
+        """How many keystrokes are still to be played."""
+        return len(self._typing) + (1 if self._typing_held else 0)
+
+    def _cancel_typing(self) -> list[Effect]:
+        """Drop the rest of the queue, letting go of a key that is still held."""
+        self._typing.clear()
+        if not self._typing_held:
+            return []
+        self._typing_held = False
+        self.keyboard.clear()
+        return [SendFrame(hid.KEYBOARD, self.keyboard.snapshot())]
+
+    def _typing_step(self, now: float) -> list[Effect]:
+        """One press or one release, whichever is due."""
+        if self._typing_held:
+            if now < self._typing_next_at:
+                return []
+            self.keyboard.clear()
+            self._typing_held = False
+            self._typing_next_at = now + STROKE_INTERVAL_S - STROKE_HOLD_S
+            self.stats.frames += 1
+            return [SendFrame(hid.KEYBOARD, self.keyboard.snapshot())]
+        if not self._typing or now < self._typing_next_at:
+            return []
+        stroke = self._typing.pop(0)
+        self.keyboard.modifiers = stroke.modifiers
+        self.keyboard.keys[:] = [stroke.usage]
+        self._typing_held = True
+        self._typing_next_at = now + STROKE_HOLD_S
+        self.stats.frames += 1
+        return [SendFrame(hid.KEYBOARD, self.keyboard.snapshot())]
 
     # -- output framing ---------------------------------------------------
 
@@ -750,8 +844,3 @@ def _replace(cfg: Config, **changes: object) -> Config:
     data = {f: getattr(cfg, f) for f in cfg.__dataclass_fields__}
     data.update(changes)
     return Config(**data)  # type: ignore[arg-type]
-
-
-
-    """Compact rendering used by the debug build."""
-    return ", ".join(type(e).__name__ for e in effects)

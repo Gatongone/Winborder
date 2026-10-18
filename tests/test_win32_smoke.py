@@ -55,6 +55,9 @@ class TestEveryHelperRuns(unittest.TestCase):
         """Used to hand back a key whose release was swallowed."""
         self.assertIn(win32.send_key_up(0x70), (True, False))   # F1
 
+    def test_the_clipboard_reads_as_text(self) -> None:
+        self.assertIsInstance(win32.read_clipboard_text(), str)
+
 
 class TestFocusFindsARealWindow(unittest.TestCase):
     """The path that raised in the released build: a window that IS there."""

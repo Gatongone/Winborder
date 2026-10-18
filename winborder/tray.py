@@ -177,13 +177,15 @@ class TrayIcon:
     MENU_CONFIG = 3
     MENU_QUIT = 4
     MENU_PAUSE = 5
+    MENU_TYPE = 6
 
     def __init__(self, tooltip: str, on_open: Callable[[], None],
                  on_quit: Callable[[], None],
                  on_reload: Callable[[], None] | None = None,
                  on_open_config: Callable[[], None] | None = None,
                  on_pause: Callable[[], None] | None = None,
-                 paused: Callable[[], bool] | None = None) -> None:
+                 paused: Callable[[], bool] | None = None,
+                 on_type_clipboard: Callable[[], None] | None = None) -> None:
         self._tooltip = tooltip[:127]
         self._on_open = on_open
         self._on_quit = on_quit
@@ -191,6 +193,7 @@ class TrayIcon:
         self._on_open_config = on_open_config
         self._on_pause = on_pause
         self._paused = paused
+        self._on_type_clipboard = on_type_clipboard
         self._hwnd: int | None = None
         self._icon = 0
         self._thread: threading.Thread | None = None
@@ -303,6 +306,9 @@ class TrayIcon:
                 _u32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
             _u32.AppendMenuW(menu, MF_STRING, self.MENU_OPEN,
                              i18n.t("Open settings"))
+            if self._on_type_clipboard is not None:
+                _u32.AppendMenuW(menu, MF_STRING, self.MENU_TYPE,
+                                 i18n.t("Type clipboard text"))
             if self._on_reload is not None:
                 _u32.AppendMenuW(menu, MF_STRING, self.MENU_RELOAD,
                                  i18n.t("Reload settings"))
@@ -327,6 +333,8 @@ class TrayIcon:
     def _run_choice(self, choice: int) -> None:
         if choice == self.MENU_PAUSE and self._on_pause is not None:
             self._on_pause()
+        elif choice == self.MENU_TYPE and self._on_type_clipboard is not None:
+            self._on_type_clipboard()
         elif choice == self.MENU_OPEN:
             self._on_open()
         elif choice == self.MENU_RELOAD and self._on_reload is not None:

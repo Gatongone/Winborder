@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 
-from . import model, win32
+from . import keystrokes, model, win32
 from .ble import BleFrameSink, BleHidPeripheral
 from .input import InputEngine
 from .output import EffectSink
@@ -68,6 +68,12 @@ class Service:
         self._pause_wanted = False
         self._refused_reason: str | None = None
         self._target_listening = False
+        # Set from another thread, applied by the step on this one.
+        self._typing_planned: keystrokes.Plan | None = None
+        # Where the link's delivered count stood when the text was queued,
+        # so the end of a paste can say whether the target took any of it.
+        self._typing_start_frames: int | None = None
+        self._typing_chars = 0
         self._cursor: tuple[int, int] = (0, 0)
 
     # -- wiring -----------------------------------------------------------
@@ -126,6 +132,35 @@ class Service:
         is already in does nothing.
         """
         self._pause_wanted = bool(paused)
+
+    def type_clipboard(self) -> dict[str, object]:
+        """Ask the service thread to type the clipboard's text into the target.
+
+        The clipboard is read and the text planned here, on the caller's thread:
+        the clipboard can wait a few milliseconds for another program to let go of
+        it, and the step must not. Only the plan crosses over, so the router is
+        touched by one thread and the step decides whether there is anywhere to
+        type.
+
+        The answer is what the caller can say out loud right away: how many
+        keystrokes were queued, how many characters the layout cannot type, or
+        that there was nothing to type and why.
+        """
+        plan = keystrokes.plan(win32.read_clipboard_text())
+        if not plan.strokes:
+            return {"result": "empty", "keys": 0, "skipped": plan.skipped,
+                    "truncated": plan.truncated}
+        if self._link is None or self._sink is None:
+            return {"result": "no_target", "keys": 0, "skipped": plan.skipped,
+                    "truncated": plan.truncated}
+        if self.router.paused:
+            # A paused router returns before the queue is played, so text queued now
+            # would sit there until the bridge was unpaused and then type itself.
+            return {"result": "paused", "keys": 0, "skipped": plan.skipped,
+                    "truncated": plan.truncated}
+        self._typing_planned = plan
+        return {"result": "queued", "keys": len(plan.strokes),
+                "skipped": plan.skipped, "truncated": plan.truncated}
 
     def status(self) -> dict[str, object]:
         """Snapshot for the debug status line and the pointer trace.
@@ -261,6 +296,7 @@ class Service:
             self.router.set_screen(width, height)
 
         self._apply_pause(now)
+        self._apply_typing()
         self._ensure_link()
         link = self._link
         if link is None or self._sink is None:
@@ -291,6 +327,7 @@ class Service:
         effects = self.router.tick(events, now, self._cursor)
         for note in self._sink.apply(effects):
             self._on_note(note)
+        self._report_typing(link)
 
     def _apply_pause(self, now: float) -> None:
         """Carry out a pause or a resume that was asked for by another thread."""
@@ -303,6 +340,54 @@ class Service:
         log.info("the bridge is %s",
                  "paused, the PC has the keyboard and mouse"
                  if self._pause_wanted else "running again")
+
+    def _report_typing(self, link: object) -> None:
+        """Say how a paste ended, and whether the target took any of it.
+
+        The delivered count is the only honest answer: a target that is not
+        listening, or a text field that was not focused, looks exactly like a paste
+        that worked from this side of the link.
+        """
+        if self._typing_start_frames is None or self.router.typing():
+            return
+        accepted = link.written_frames - self._typing_start_frames
+        self._typing_start_frames = None
+        log.info("typed %d characters, %d reports accepted",
+                 self._typing_chars, accepted)
+        if accepted == 0:
+            log.warning("the target accepted no keystrokes: it is not listening, "
+                        "or no text field had focus")
+
+    def _apply_typing(self) -> None:
+        """Hand a clipboard request to the router, and say what became of it."""
+        plan, self._typing_planned = self._typing_planned, None
+        if plan is None:
+            return
+        if not plan.strokes:
+            log.info("nothing to type: the clipboard holds no text this layout can "
+                     "type")
+            return
+        if self._link is None or self._sink is None:
+            log.info("not typing: the target is not connected")
+            return
+        reason = self.router.type_text(plan)
+        if reason == "queued":
+            self._typing_start_frames = (self._link.written_frames
+                                         if self._link is not None else 0)
+            self._typing_chars = len(plan.strokes)
+            log.info("typing %d characters into the target", len(plan.strokes))
+            if plan.skipped:
+                log.info("%d characters cannot be typed in this layout, and were "
+                         "left out", plan.skipped)
+            if plan.truncated:
+                log.info("%d characters past the limit were not typed",
+                         plan.truncated)
+        elif reason == "busy":
+            log.info("not typing: the previous text is still going out")
+        elif reason == "keys_held":
+            log.info("not typing: keys are held, so the report would let go of them")
+        else:
+            log.debug("typing refused: %s", reason)
 
     def _on_note(self, note: str) -> None:
         pointer = self.router.pointer_report()
@@ -338,3 +423,9 @@ class Service:
             log.debug("bridge paused by hand, the PC has the keyboard and mouse")
         elif note.startswith("resumed"):
             log.debug("bridge resumed")
+        elif note == "type_requested":
+            self._typing_planned = keystrokes.plan(win32.read_clipboard_text())
+        elif note == "typing_cancelled":
+            # The queue was dropped because a key was pressed: say so once, so a
+            # paste that stopped halfway has an explanation in the log.
+            log.info("typing stopped: the keyboard was used")

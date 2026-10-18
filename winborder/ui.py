@@ -93,6 +93,8 @@ FIELDS: tuple[Field, ...] = (
           "Releases the keyboard and mouse back to the PC at once"),
     Field("toggle_edge_keys", "Toggle edge crossing", "keys",
           "Turns the pointer's screen crossing on or off"),
+    Field("type_clipboard_keys", "Type clipboard", "keys",
+          "Sends the PC clipboard to the target as ASCII characters"),
     Field("forward_consumer_keys", "Forward media keys", "bool",
           "Volume and transport keys go to the target"),
     Field("capture_mouse_buttons", "Capture mouse buttons", "bool",
@@ -252,7 +254,8 @@ PAGES: tuple[tuple[str, str, str, str,
                      ("invert_wheel_v", "invert_wheel_h"))))),
     ("keyboard", "Keyboard", "keyboard",
      "Keys the PC keeps for itself, and what the target receives",
-     (("PC keys", (("panic_keys",), ("toggle_edge_keys",))),
+     (("PC keys", (("panic_keys",), ("toggle_edge_keys",),
+                  ("type_clipboard_keys",))),
       ("Target keyboard", (("capture_mouse_buttons", "forward_consumer_keys"),
                            ("remap",))))),
     ("log", "Log", "terminal", "Everything Winborder reports", ()),
@@ -548,7 +551,8 @@ class SettingsWindow:
         self.tray = TrayIcon("Winborder", self._open_from_tray, self._quit_from_tray,
                              self._reload_from_tray, self._open_config_file,
                              on_pause=self._pause_from_tray,
-                             paused=lambda: self._bridge_paused)
+                             paused=lambda: self._bridge_paused,
+                             on_type_clipboard=self._type_clipboard_from_tray)
         self._service_thread = threading.Thread(target=self._run_service,
                                                 name="winborder-service", daemon=True)
 
@@ -1416,6 +1420,32 @@ class SettingsWindow:
     def _open_config_file(self) -> None:
         self._events.put(("open-config", None))
 
+    def _type_clipboard_from_tray(self) -> None:
+        """Type the clipboard into the target, and answer in the window."""
+        self._events.put(("type-clipboard", None))
+
+    def type_clipboard(self) -> None:
+        """Send the clipboard as keystrokes, and say what became of the request.
+
+        The window is the only place that can say it: the tray has no room for a
+        sentence, and "nothing happened" is the answer a silent refusal gives.
+        """
+        outcome = self.service.type_clipboard()
+        result = outcome["result"]
+        if result == "empty":
+            self._notify(i18n.t("The clipboard holds no text this layout can type"),
+                         error=True)
+        elif result == "no_target":
+            self._notify(i18n.t("The target is not connected"), error=True)
+        elif result == "paused":
+            self._notify(i18n.t("The bridge is paused"), error=True)
+        elif outcome["skipped"]:
+            self._notify(i18n.t("Typing {count} characters, {skipped} left out").format(
+                count=outcome["keys"], skipped=outcome["skipped"]))
+        else:
+            self._notify(i18n.t("Typing {count} characters").format(
+                count=outcome["keys"]))
+
     def _run_service(self) -> None:
         try:
             self.service.run()
@@ -1440,6 +1470,8 @@ class SettingsWindow:
                 self.toggle_bridge()
             elif action == "open-config":
                 self._open_path(self.config_path)
+            elif action == "type-clipboard":
+                self.type_clipboard()
         if not self._closing:
             self.root.after(POLL_MS, self._pump_events)
 

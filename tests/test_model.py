@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import unittest
 
-from winborder import hid, keymap, model
+from winborder import hid, keymap, keystrokes, model
 
 SCREEN = (1920, 1080)
 VK_F1 = 0x70
 VK_F2 = 0x71
+VK_F3 = 0x72
 
 
 def make_router(side: model.Side = model.Side.RIGHT, **overrides) -> model.Router:
@@ -903,6 +904,17 @@ class TestPause(unittest.TestCase):
 
 
 class TestConfigValidation(unittest.TestCase):
+    def test_rejects_a_gain_that_stops_the_pointer(self) -> None:
+        """Zero gain is not a slow pointer, it is a pointer that never moves."""
+        for value in (0.0, -0.1):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    model.Config(sensitivity=value)
+
+    def test_rejects_negative_acceleration(self) -> None:
+        with self.assertRaises(ValueError):
+            model.Config(accel=-0.1)
+
     def test_rejects_negative_pull_distance(self) -> None:
         with self.assertRaises(ValueError):
             model.Config(pullback_distance=-1)
@@ -916,6 +928,124 @@ class TestConfigValidation(unittest.TestCase):
         self.assertIs(cfg.side, model.Side.BOTTOM)
         self.assertTrue(cfg.pullback_exit)
         self.assertTrue(cfg.edge_trigger_enabled)
+
+
+class TestTyping(unittest.TestCase):
+    """Clipboard text leaves as one press and one release per character.
+
+    The report is a key state, so a character is two frames at least, and the pace
+    is what keeps the target from reading the next key as a repeat.
+    """
+
+    TICK = 0.004
+
+    def setUp(self) -> None:
+        self.router = make_router()
+
+    def play(self, now: float = 0.0, ticks: int = 40) -> list[bytes]:
+        """Run the loop for a while and collect the keyboard frames it sent."""
+        frames = []
+        for _ in range(ticks):
+            now += self.TICK
+            for effect in self.router.tick([], now, (10, 10)):
+                if isinstance(effect, model.SendFrame) and effect.kind == hid.KEYBOARD:
+                    frames.append(effect.payload)
+        return frames
+
+    def type(self, text: str) -> str:
+        return self.router.type_text(keystrokes.plan(text))
+
+    def test_one_character_is_a_press_and_a_release(self) -> None:
+        self.assertEqual(self.type("a"), "queued")
+        self.assertEqual(self.play(), [hid.encode_keyboard(0, (0x04,)),
+                                       hid.encode_keyboard(0, ())])
+
+    def test_a_capital_letter_holds_shift(self) -> None:
+        self.type("A")
+        frames = self.play()
+        self.assertEqual(frames[0],
+                         hid.encode_keyboard(keymap.MOD_LEFT_SHIFT, (0x04,)))
+        self.assertEqual(frames[1], hid.encode_keyboard(0, ()))
+
+    def test_two_characters_are_two_presses_and_two_releases(self) -> None:
+        self.type("ab")
+        self.assertEqual(self.play(), [
+            hid.encode_keyboard(0, (0x04,)), hid.encode_keyboard(0, ()),
+            hid.encode_keyboard(0, (0x05,)), hid.encode_keyboard(0, ()),
+        ])
+
+    def test_the_queue_drains_to_nothing(self) -> None:
+        self.type("abc")
+        self.assertEqual(self.router.typing(), 3)
+        self.play(ticks=80)
+        self.assertEqual(self.router.typing(), 0)
+
+    def test_a_second_request_is_refused_while_one_is_playing(self) -> None:
+        self.type("abc")
+        self.assertEqual(self.type("xy"), "busy")
+        self.assertEqual(self.router.typing(), 3, "the queue was not replaced")
+
+    def test_text_that_the_layout_cannot_type_is_refused(self) -> None:
+        self.assertEqual(self.type("中文"), "empty")
+        self.assertEqual(self.router.typing(), 0)
+
+    def test_a_held_key_refuses_typing_rather_than_letting_go_of_it(self) -> None:
+        self.router.keyboard.key_down(0x04)
+        self.assertEqual(self.type("ab"), "keys_held")
+        self.assertEqual(self.router.typing(), 0)
+        self.assertEqual(self.router.keyboard.keys, [0x04], "the held key survived")
+
+    def test_a_real_key_cancels_the_queue(self) -> None:
+        self.type("abcdef")
+        now = self.TICK
+        self.router.tick([], now, (10, 10))
+        effects = self.router.tick(
+            [model.KeyPress(vk=0x1B, down=True)], now + self.TICK, (10, 10))
+        self.assertEqual(self.router.typing(), 0)
+        self.assertTrue(any(isinstance(effect, model.Notify)
+                            and effect.event == "typing_cancelled"
+                            for effect in effects))
+        # The key that was held when the queue was dropped is let go of.
+        frames = [effect.payload for effect in effects
+                  if isinstance(effect, model.SendFrame)
+                  and effect.kind == hid.KEYBOARD]
+        self.assertIn(hid.encode_keyboard(0, ()), frames)
+
+    def test_the_clipboard_key_asks_the_service_for_the_clipboard(self) -> None:
+        """The router has no I/O, so the key becomes a note and not a read."""
+        router = model.Router(config=model.Config(side=model.Side.RIGHT),
+                              screen=SCREEN, handoff_allowed=lambda: (True, ""))
+        router.note_link_ok(0.0)
+        router.enter_target(at_edge(model.Side.RIGHT), 0.0)
+        effects = router.tick([model.KeyPress(vk=VK_F3, down=True)], 0.1, (10, 10))
+        self.assertTrue(any(isinstance(effect, model.Notify)
+                            and effect.event == "type_requested"
+                            for effect in effects))
+        # Swallowed: the target has no use for the key that asked for it.
+        keys = [effect for effect in effects
+                if isinstance(effect, model.SendFrame) and effect.kind == hid.KEYBOARD]
+        self.assertFalse(any(0x3D in effect.payload[1:] for effect in keys))
+
+    def test_the_clipboard_key_does_nothing_while_the_pc_has_control(self) -> None:
+        router = make_router()
+        effects = router.tick([model.KeyPress(vk=VK_F3, down=True)], 0.1, (10, 10))
+        self.assertFalse(any(isinstance(effect, model.Notify)
+                             and effect.event == "type_requested"
+                             for effect in effects))
+
+    def test_leaving_the_target_drops_the_queue(self) -> None:
+        router = model.Router(config=model.Config(side=model.Side.RIGHT),
+                              screen=SCREEN, handoff_allowed=lambda: (True, ""))
+        router.note_link_ok(0.0)
+        router.enter_target(at_edge(model.Side.RIGHT), 0.0)
+        self.assertEqual(router.type_text(keystrokes.plan("abc")), "queued")
+        router.leave_target("test", 0.1)
+        self.assertEqual(router.typing(), 0)
+
+    def test_pausing_drops_the_queue(self) -> None:
+        self.type("abc")
+        self.router.set_paused(True, 0.1)
+        self.assertEqual(self.router.typing(), 0)
 
 
 if __name__ == "__main__":
