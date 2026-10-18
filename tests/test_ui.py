@@ -428,6 +428,15 @@ class TestKeyField(unittest.TestCase):
         field._pressed(self.Event(0xFF))       # not a key the host knows
         self.assertEqual(field.value, "Escape")
 
+    def test_a_modifier_is_named_with_the_side_that_has_one(self) -> None:
+        """VK_CONTROL has no side, and the settings file needs one."""
+        for code, name in ((0x11, "LeftCtrl"), (0x12, "LeftAlt"), (0x10, "LeftShift")):
+            with self.subTest(key=name):
+                field = self.field()
+                field.capture()
+                field._pressed(self.Event(code))
+                self.assertEqual(field.value, name)
+
     def test_a_field_that_was_only_clicked_stays_empty(self) -> None:
         field = self.field()
         field.capture()
@@ -846,6 +855,46 @@ class TestLinkSummary(unittest.TestCase):
         self.assertNotIn("cut short", line)
 
 
+class TestGainBounds(unittest.TestCase):
+    def test_a_gain_of_zero_is_refused(self) -> None:
+        form = ui.SettingsForm()
+        form.values["sensitivity"] = "0"
+        with self.assertRaises(config.ConfigError):
+            form.settings({})
+        form.values["sensitivity"] = "0.5"
+        self.assertEqual(form.settings({})["sensitivity"], 0.5)
+
+    def test_negative_acceleration_is_refused(self) -> None:
+        form = ui.SettingsForm()
+        form.values["accel"] = "-0.1"
+        with self.assertRaises(config.ConfigError):
+            form.settings({})
+
+
+class TestNumberFields(unittest.TestCase):
+    """The charset a number passes through, not the value it ends up as."""
+
+    def test_an_integer_field_takes_digits_and_a_minus_sign(self) -> None:
+        allowed = ui.number_allowed(False)
+        for text_ in ("", "-", "0", "12", "-4"):
+            with self.subTest(text=text_):
+                self.assertTrue(allowed(text_))
+        for text_ in ("a", "1a", "1.2", "-", "--1", "1 2", "1e5"):
+            with self.subTest(text=text_):
+                if text_ == "-":
+                    continue
+                self.assertFalse(allowed(text_))
+
+    def test_a_float_field_takes_one_point(self) -> None:
+        allowed = ui.number_allowed(True)
+        for text_ in ("", "-", "1", "1.5", ".5", "-0.25"):
+            with self.subTest(text=text_):
+                self.assertTrue(allowed(text_))
+        for text_ in ("1.2.3", "1,5", "abc"):
+            with self.subTest(text=text_):
+                self.assertFalse(allowed(text_))
+
+
 class TestWindowLayout(unittest.TestCase):
     """The window has to fill its width, at whatever scale the display asks."""
 
@@ -867,6 +916,32 @@ class TestWindowLayout(unittest.TestCase):
         """Filling the form is not editing it."""
         self.window.root.update()
         self.assertFalse(Path(self.window.config_path).exists())
+
+    def test_a_number_field_refuses_letters_as_they_are_typed(self) -> None:
+        """A rejected value that only fails on save looks accepted until then."""
+        control = self.window._controls["notch_up"]
+        entry = control._widget
+        entry.delete(0, "end")
+        entry.insert(0, "3")
+        self.assertEqual(control.read(), "3")
+        entry.insert("end", "a")
+        self.assertEqual(control.read(), "3", "the letter was not taken")
+
+    def test_a_key_setting_is_entered_by_pressing_the_key(self) -> None:
+        """116 names make a typed key field a place to get a name wrong."""
+        control = self.window._controls["panic_keys"]
+        self.assertIsInstance(control, ui._KeyControl)
+        self.assertIsInstance(control._widget, widgets.KeyField)
+        control.write("F1")
+        self.assertEqual(self.window._read()["panic_keys"], ["F1"])
+
+    def test_pressing_a_key_writes_its_name(self) -> None:
+        field = self.window._controls["panic_keys"]._widget
+        field.capture()
+        self.assertEqual(field._pressed(mock.Mock(keycode=keymap.KEY_NAMES["F2"][0])),
+                         "break")
+        self.assertEqual(field.value, "F2")
+        self.assertEqual(self.window._read()["panic_keys"], ["F2"])
 
     def test_the_sidebar_holds_the_bridge_and_lets_it_go(self) -> None:
         button = self.window.sidebar.items["pause"]

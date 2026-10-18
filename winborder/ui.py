@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import queue
 import subprocess
 import threading
@@ -33,8 +34,8 @@ from pathlib import Path
 from .scan import DeviceScanner
 from .tray import TrayIcon
 from . import widgets
-from .widgets import Card, CheckBox, Icon, RemapList, Row, Separator, Sidebar, \
-    ThemedLabel, ToggleSwitch
+from .widgets import Card, CheckBox, Icon, KeyField, RemapList, Row, Separator, \
+    Sidebar, ThemedLabel, ToggleSwitch
 
 log = logging.getLogger("winborder.ui")
 
@@ -71,9 +72,7 @@ FIELDS: tuple[Field, ...] = (
     Field("accel", "Speed gain", "float",
           "Extra pointer gain proportional to how fast the mouse moves"),
     Field("pullback_distance", "Damping", "int",
-          "How far you have to pull back towards the PC before control returns. "
-          "Raise it if a return arrives while the target pointer still looks "
-          "inside its screen"),
+          "Pull-back distance needed for control to return"),
     Field("invert_wheel_v", "Invert vertical scroll", "bool",
           "Vertical scrolling is reversed on the target"),
     Field("invert_wheel_h", "Invert horizontal scroll", "bool",
@@ -91,27 +90,30 @@ FIELDS: tuple[Field, ...] = (
     Field("pullback_exit", "Return by pulling back", "bool",
           "Pulling the pointer towards the PC returns control"),
     Field("panic_keys", "Release control", "keys",
-          "Comma separated key names, for example F1"),
+          "Releases the keyboard and mouse back to the PC at once"),
     Field("toggle_edge_keys", "Toggle edge crossing", "keys",
-          "Comma separated key names, for example F2"),
+          "Turns the pointer's screen crossing on or off"),
     Field("forward_consumer_keys", "Forward media keys", "bool",
           "Volume and transport keys go to the target"),
     Field("capture_mouse_buttons", "Capture mouse buttons", "bool",
           "Clicks go to the target while it has control"),
     Field("start_with_windows", "Start with Windows", "bool",
-          "One value under HKCU Software\\Microsoft\\Windows\\CurrentVersion\\Run, "
-          "holding the command line; nothing else is written"),
+          "One value under HKCU Software\\Microsoft\\Windows\\CurrentVersion\\Run, holding the command line; nothing else is written"),
     Field("start_hidden", "Start hidden", "bool",
           "Open with the notification area icon only, without this window"),
     Field("language", "Language", "choice",
-          "The language of this window. Changes apply immediately",
+          "Language of this window",
           i18n.codes()),
     Field("remap", "Remap keys", "remap",
-          "Click a field and press the key, or right-click it to pick from the "
-          "full list. The PC is unaffected"),
+          "Key remapping for the target device; right-click a field to choose from the full list"),
 )
 
 FIELDS_BY_NAME = {field.name: field for field in FIELDS}
+
+#: Settings a zero or a negative value would silence: a pointer gain of zero moves
+#: the target pointer nowhere at all, which reads as a broken link.
+MUST_BE_POSITIVE = ("sensitivity",)
+MUST_NOT_BE_NEGATIVE = ("accel",)
 
 # What a dropdown shows for each value it accepts. A value is what the settings
 # file holds and is never translated; only what stands for it is.
@@ -243,7 +245,7 @@ PAGES: tuple[tuple[str, str, str, str,
       ("Crossing", (("edge_inset", "enter_cooldown"), ("exit_clear_distance",))),
       ("Returning", (("pullback_distance",), ("pullback_exit",))))),
     ("nearby", "Devices", "bluetooth",
-     "What this PC can see over Bluetooth LE", ()),
+     "BLE devices around this PC", ()),
     ("pointer", "Pointer", "pointer", "How mouse movement reaches the target",
      (("Movement", (("sensitivity", "accel"),)),
       ("Scrolling", (("notch_up", "notch_down"),
@@ -277,7 +279,7 @@ STATUS_CONTROL_WIDTH = 300
 ABOUT_ROWS: tuple[tuple[str, str, str], ...] = (
     ("version", "Version", "Shared by the window and the background service"),
     ("runtime", "Running from", "An executable, or Python"),
-    ("developer", "Developer", "Author of Winborder"),
+    ("developer", "Developer", "Maintainer of this project"),
     ("repository", "Repository", "Source code and releases"),
     ("license", "License", "Terms for use and redistribution"),
     ("settings", "Settings file",
@@ -303,11 +305,30 @@ class Control:
         raise NotImplementedError
 
 
+def number_allowed(allow_point: bool) -> Callable[[str], bool]:
+    """Whether an entry text could still become a number.
+
+    The setting is validated when it is committed, which is too late to be useful:
+    the field had already taken the text, so a typo looked accepted until the next
+    save. This rejects the keystroke instead, and allows the states a number passes
+    through while it is being typed -- empty, and a lone minus sign.
+    """
+
+    pattern = r"-?\d*(?:\.\d*)?" if allow_point else r"-?\d*"
+
+    def allowed(proposed: str) -> bool:
+        return re.fullmatch(pattern, proposed) is not None
+
+    return allowed
+
+
 class _VariableControl(Control):
     """A control backed by a Tk variable, holding what the form holds."""
 
-    def __init__(self, variable: tk.Variable) -> None:
+    def __init__(self, variable: tk.Variable,
+                 widget: tk.Widget | None = None) -> None:
         self._variable = variable
+        self._widget = widget
 
     def read(self) -> object:
         return self._variable.get()
@@ -342,6 +363,24 @@ class _ChoiceControl(Control):
         raw = str(value)
         self._variable.set(labels[self._field.choices.index(raw)]
                            if raw in self._field.choices else "")
+
+
+class _KeyControl(Control):
+    """A key entered by pressing it, held as the name the form and the file use.
+
+    The setting is a list and the file writes it comma separated, but a row with
+    one key on it is a row with one key on it: the control carries the same string,
+    and pressing a key replaces it.
+    """
+
+    def __init__(self, widget: "KeyField") -> None:
+        self._widget = widget
+
+    def read(self) -> object:
+        return self._widget.value
+
+    def write(self, value: object) -> None:
+        self._widget.set(str(value))
 
 
 class _RemapControl(Control):
@@ -396,10 +435,17 @@ class SettingsForm:
                     out.pop(field.name, None)
                     continue
                 try:
-                    out[field.name] = int(text) if field.kind == "int" else float(text)
+                    number = int(text) if field.kind == "int" else float(text)
                 except ValueError:
                     raise config.ConfigError(
                         i18n.t("{label} must be a number").format(label=label)) from None
+                if field.name in MUST_BE_POSITIVE and number <= 0:
+                    raise config.ConfigError(
+                        i18n.t("{label} must be greater than zero").format(label=label))
+                if field.name in MUST_NOT_BE_NEGATIVE and number < 0:
+                    raise config.ConfigError(
+                        i18n.t("{label} must not be negative").format(label=label))
+                out[field.name] = number
             elif field.kind == "keys":
                 names = [name.strip() for name in str(raw).split(",") if name.strip()]
                 for name in names:
@@ -513,6 +559,9 @@ class SettingsWindow:
     # -- construction -----------------------------------------------------
 
     def _build(self) -> None:
+        # Every row, so the control column can be measured once the window has been
+        # styled: the style is what sets the height of what the rows hold.
+        self._rows: list[Row] = []
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
 
@@ -727,6 +776,7 @@ class SettingsWindow:
                           self._control(parent, name))
                 row.grid(row=index * 2, column=0, sticky="ew")
                 self._paintable.append(row)
+                self._rows.append(row)
 
     def _remap_block(self, card: tk.Frame, index: int, field: Field) -> None:
         """The remap list takes the width of the card, not the width of a control.
@@ -773,6 +823,15 @@ class SettingsWindow:
             return ToggleSwitch(parent, variable, palette,
                                 command=lambda: self._changed(name),
                                 background=palette.surface)
+        if field.kind == "keys":
+            # 116 key names make a dropdown a search problem dressed as a field,
+            # and a typed name is a name that can be wrong.
+            key_field = KeyField(parent, palette, width=10,
+                                 on_change=lambda: self._changed(name))
+            self._controls[name] = _KeyControl(key_field)
+            key_field.bind("<Return>", lambda _event: self._commit())
+            key_field.bind("<FocusOut>", lambda _event: self._commit())
+            return key_field
         variable = tk.StringVar()
         self._variables[name] = variable
         if field.kind == "choice":
@@ -782,10 +841,12 @@ class SettingsWindow:
             self._controls[name] = _ChoiceControl(field, variable)
         elif field.kind in ("int", "float"):
             control = ttk.Entry(parent, textvariable=variable, width=12)
-            self._controls[name] = _VariableControl(variable)
+            check = self.root.register(number_allowed(field.kind == "float"))
+            control.configure(validate="key", validatecommand=(check, "%P"))
+            self._controls[name] = _VariableControl(variable, control)
         else:
             control = ttk.Entry(parent, textvariable=variable, width=20)
-            self._controls[name] = _VariableControl(variable)
+            self._controls[name] = _VariableControl(variable, control)
         variable.trace_add("write", lambda *_: self._changed(name))
         control.bind("<Return>", lambda _event: self._commit())
         control.bind("<FocusOut>", lambda _event: self._commit())
@@ -816,6 +877,7 @@ class SettingsWindow:
                       make_value, control_width=STATUS_CONTROL_WIDTH)
             row.grid(row=index * 2, column=0, sticky="ew")
             self._paintable.append(row)
+            self._rows.append(row)
 
     def _about_page(self, body: tk.Frame) -> None:
         """Where things live, and what is running."""
@@ -859,6 +921,7 @@ class SettingsWindow:
                       make_value, control_width=ABOUT_CONTROL_WIDTH)
             row.grid(row=index * 2, column=0, sticky="ew")
             self._paintable.append(row)
+            self._rows.append(row)
 
         tools = tk.Frame(body, background=palette.bg)
         tools.grid(row=self._next_row(body), column=0, sticky="w",
@@ -1001,7 +1064,7 @@ class SettingsWindow:
 
         note = ThemedLabel(
             body, palette,
-            i18n.t("The target connects from its own Bluetooth settings, where this PC is listed under its Bluetooth name. The list below only shows what is nearby: this PC never appears in it."),
+            i18n.t("Nearby BLE does not include this PC"),
             tone="muted", font=theme.UI_FONT_SMALL, wraplength=self.px(520))
         note.grid(row=2, column=0, sticky="ew", padx=self.px(26),
                   pady=(self.px(6), 0))
@@ -1273,6 +1336,10 @@ class SettingsWindow:
         self.palette = palette
         self.watcher.theme = palette
         theme.apply(self.root, ttk.Style(self.root), palette, self.scale)
+        # Fit after the window has been laid out: a control only reports the height
+        # its style gives it once the toplevel has been mapped, so a measurement
+        # taken here would still be the pre-style one.
+        self.root.after_idle(self._fit_rows)
         self.root.configure(background=palette.bg)
         self.content.configure(background=palette.bg)
         self.sidebar.repaint(palette)
@@ -1285,6 +1352,11 @@ class SettingsWindow:
             if widget is not None:
                 theme.style_text(widget, palette)
         self._apply_caption(palette)
+
+    def _fit_rows(self) -> None:
+        """Give every row the height its control needs, once the style is in force."""
+        for row in getattr(self, "_rows", ()):
+            row.fit()
 
     def _apply_caption(self, palette: theme.Theme) -> None:
         """Colour the caption once the window exists.

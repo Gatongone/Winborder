@@ -603,10 +603,22 @@ class Row(tk.Frame):
             # The width is fixed so the column lines up, and the height is taken
             # from the control: holding back only the width would squeeze the
             # control to whatever height the holder was left with.
-            holder.configure(height=self.control.winfo_reqheight())
-            holder.pack_propagate(False)
             self.control.pack(**control_pack(self.control))
+            holder.pack_propagate(False)
+            self.fit()
         self._children.extend([self.title, self.description])
+
+    def fit(self) -> None:
+        """Give the holder the height its control actually needs.
+
+        Asked again after the window is styled: a ttk style with padding makes
+        every control taller, and a holder that kept the height it was given while
+        the window was still being built clips what it holds -- a button loses the
+        bottom of its own text.
+        """
+        if self.control is None:
+            return
+        self.holder.configure(height=self.control.winfo_reqheight())
 
     def repaint(self, palette: Theme) -> None:
         self.configure(background=palette.surface)
@@ -746,9 +758,15 @@ class KeyField(ttk.Button):
     not have cannot be pressed at all, so a right click opens the whole list.
     """
 
+    #: Windows sends one virtual key code for both sides of a modifier, so a
+    #: capture that lands on it names the left hand key; the right hand one is in
+    #: the list the right click offers.
+    GENERIC_MODIFIERS = {0x10: "LeftShift", 0x11: "LeftCtrl", 0x12: "LeftAlt",
+                         0x5B: "LeftWin", 0x5C: "RightWin"}
+
     def __init__(self, parent: tk.Widget, palette: Theme, value: str = "",
                  on_change: Callable[[], None] | None = None,
-                 width: int = 12) -> None:
+                 width: int = 10) -> None:
         self.value = value
         self._on_change = on_change
         self._capturing = False
@@ -763,15 +781,28 @@ class KeyField(ttk.Button):
     def _label(self) -> str:
         return self.value or i18n.t("Press a key")
 
+    def _show(self) -> None:
+        """Draw the label, and size the button to it.
+
+        A fixed width made a two character key name sit in a bar the width of the
+        settings column, which reads as an empty field rather than a key. Sized to
+        its own text, the control looks like what it is: one key.
+        """
+        label = self._label()
+        key_width = len(label) + 2
+        # "Press a key" is a prompt, not a key: it needs the room to be read.
+        self.configure(text=label,
+                       width=max(6, key_width) if self.value else 14)
+
     def set(self, value: str) -> None:
         self.value = value
         self._capturing = False
-        self.configure(text=self._label())
+        self._show()
 
     def capture(self) -> None:
         """Wait for the next key, and show that it is waiting."""
         self._capturing = True
-        self.configure(text="…")
+        self.configure(text="…", width=6)
         self.focus_set()
 
     def pick(self) -> "KeyPicker":
@@ -790,8 +821,10 @@ class KeyField(ttk.Button):
         if not self._capturing:
             return ""
         # On Windows a Tk key event carries the virtual key code, which is what
-        # the key map is written in.
-        name = keymap.describe_vk(int(getattr(event, "keycode", 0)))
+        # the key map is written in -- except for the modifiers, which arrive as
+        # VK_SHIFT / VK_CONTROL / VK_MENU with no side to them.
+        code = int(getattr(event, "keycode", 0))
+        name = self.GENERIC_MODIFIERS.get(code) or keymap.describe_vk(code)
         if name not in keymap.KEY_NAMES:
             self.bell()
             return "break"
