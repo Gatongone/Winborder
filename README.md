@@ -10,6 +10,13 @@ Move the cursor to the screen edge and the same physical keyboard and mouse driv
 
 The host is Windows only. The target may be any device that accepts a Bluetooth LE HID peripheral.
 
+## Features
+
+1. Allowing you to control up to target devices (iPad, iPhone, Android etc.) from a single mouse and keyboard.
+2. Send clipboard content to target devices (english only).
+3. Convenient visual UI tools.
+4. Remap key to target devices.
+
 ## Install
 
 Get executable file or installer from [Releases Page](https://github.com/Gatongone/Winborder/releases).
@@ -21,10 +28,6 @@ Get executable file or installer from [Releases Page](https://github.com/Gatongo
 | Host OS | Windows 10 1703 or newer (x64). Tested on Windows 11. |
 | Bluetooth | An adapter that supports the Bluetooth LE peripheral role.|
 | Target | A device that acts as a BLE central accepting HID peripherals.|
-
-The host must run DPI aware. The program sets per-monitor v2 awareness itself at startup.
-
-### Dependencies
 
 Everything except the Bluetooth bindings uses the Python standard library and `ctypes`:
 
@@ -71,19 +74,9 @@ The two scripts in `.github/tools` are what the release workflow runs. They need
 
 ```
 pip install pyinstaller
-
 python .github/tools/build_exe.py
 python .github/tools/build_installer.py
 ```
-
-## Releases
-
-Publishing a release is the whole procedure. The workflow in `.github/workflows/release.yml` runs on `release: published`, and by the time it is done the release carries:
-
-| Asset | Description |
-| --- | --- |
-| `Winborder-<version>-Setup.exe` | The installer. |
-| `Winborder.exe` | The same program as one file, for anyone who would rather not install it. |
 
 ## License
 
