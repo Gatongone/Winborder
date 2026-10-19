@@ -7,7 +7,7 @@ target sees a standard Bluetooth keyboard and mouse and installs nothing.
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # Who made it and under what terms. The About card shows these, so they live
 # beside the version rather than being typed into the window.
