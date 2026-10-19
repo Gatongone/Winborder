@@ -1,0 +1,13 @@
+# What Winborder imports at run time, and what a build has to bundle with it.
+#
+# These are not one package: PyWinRT publishes a wheel per WinRT namespace, and
+# every namespace the program touches has to be here. A missing one does not fail
+# at startup, it fails inside a callback -- the failure reads as "the radio does
+# not work", which is the one answer this program must never give.
+winrt-runtime
+winrt-Windows.Devices.Bluetooth
+winrt-Windows.Devices.Bluetooth.Advertisement
+winrt-Windows.Devices.Bluetooth.GenericAttributeProfile
+winrt-Windows.Storage.Streams
+winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections

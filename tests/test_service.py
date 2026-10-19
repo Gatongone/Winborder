@@ -138,6 +138,18 @@ class TestConnect(unittest.TestCase):
         self.assertTrue(all(line.startswith("DEBUG") for line in captured.output),
                         captured.output)
 
+    def test_the_report_map_read_is_shown(self) -> None:
+        """The one read a user needs: it says the target reached the service.
+
+        Every other read is detail, but this one is the difference between a
+        target that never arrived and one that arrived, paired and stopped short
+        of subscribing -- and the window said nothing about either before.
+        """
+        service = self.listening_service(open_link=False)
+        with self.assertLogs("winborder.service", level="INFO") as captured:
+            service._on_ble_event("report-map-read", "a host read the report map")
+        self.assertIn("reading the HID descriptor", captured.output[0])
+
     def test_nothing_is_advertising_without_a_peripheral(self) -> None:
         service = Service()
         self.assertEqual(service.status()["advertising"], "not started")

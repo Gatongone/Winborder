@@ -9,6 +9,7 @@ target as silence rather than as an error.
 from __future__ import annotations
 
 import asyncio
+import threading
 import unittest
 
 from winborder import ble, hid
@@ -47,6 +48,9 @@ class StubPeripheral:
     def release_all(self) -> bool:
         self.calls.append(("release_all",))
         return True
+
+    def refresh_subscriptions(self) -> None:
+        self.calls.append(("refresh",))
 
     def stop(self) -> None:
         self.stopped = True
@@ -166,6 +170,110 @@ class TestLinkSurface(unittest.TestCase):
         frame_sink.close()
         self.assertTrue(peripheral.stopped)
         self.assertIn(("release_all",), peripheral.calls)
+
+    def test_a_refresh_reaches_the_peripheral(self) -> None:
+        """The watchdog asks the sink, and the sink asks the radio."""
+        frame_sink, peripheral = sink()
+        frame_sink.refresh_subscriptions()
+        self.assertEqual(peripheral.calls, [("refresh",)])
+
+
+class TestSubscriptionTracking(unittest.TestCase):
+    """Who is subscribed is the whole meaning of "connected".
+
+    ``SubscribedClientsChanged`` is the one event that says a target arrived, and
+    an event that is not delivered looks exactly like a target that never came.
+    Both the event and the poll behind it land in the same place, so these are
+    the rules for what that place says: once per change, and never twice for the
+    same state, because the poll asks every second.
+    """
+
+    def peripheral(self) -> tuple[ble.BleHidPeripheral, list[tuple[str, str]]]:
+        events: list[tuple[str, str]] = []
+        # Built without __init__: the constructor loads WinRT, and none of this
+        # bookkeeping needs a radio.
+        peripheral = ble.BleHidPeripheral.__new__(ble.BleHidPeripheral)
+        peripheral._subscribed = set()
+        peripheral._sub_lock = threading.Lock()
+        peripheral._serving = True
+        peripheral._subscriptions_unreadable = False
+        peripheral._reports = {}
+        peripheral._on_event = lambda kind, text: events.append((kind, text))
+        return peripheral, events
+
+    def test_the_first_report_is_announced(self) -> None:
+        peripheral, events = self.peripheral()
+        peripheral._note_subscription(1, True)
+        self.assertTrue(peripheral.is_subscribed)
+        self.assertEqual([kind for kind, _ in events], ["subscribed"])
+
+    def test_the_same_state_twice_is_said_once(self) -> None:
+        peripheral, events = self.peripheral()
+        for _ in range(5):
+            peripheral._note_subscription(1, True)
+        self.assertEqual(len(events), 1, "a poll every second is not news")
+
+    def test_losing_the_last_report_is_the_link_going(self) -> None:
+        peripheral, events = self.peripheral()
+        peripheral._note_subscription(1, True)
+        peripheral._note_subscription(1, False)
+        self.assertFalse(peripheral.is_subscribed)
+        self.assertEqual([kind for kind, _ in events],
+                         ["subscribed", "unsubscribed"])
+
+    def test_a_report_that_was_never_subscribed_says_nothing(self) -> None:
+        peripheral, events = self.peripheral()
+        peripheral._note_subscription(2, False)
+        self.assertEqual(events, [])
+
+    def test_one_of_three_reports_is_still_a_connected_target(self) -> None:
+        peripheral, _ = self.peripheral()
+        peripheral._note_subscription(1, True)
+        peripheral._note_subscription(2, False)
+        self.assertTrue(peripheral.is_subscribed)
+
+    def test_a_subscriber_present_at_start_is_adopted(self) -> None:
+        """Windows hands a new server the subscribers that are already there."""
+        peripheral, events = self.peripheral()
+        peripheral._serving = False
+        peripheral._note_subscription(1, True)
+        self.assertEqual([kind for kind, _ in events], ["adopted", "subscribed"])
+
+    def test_a_poll_sees_a_subscriber_the_event_missed(self) -> None:
+        """This is the whole point of the poll: a missed event is not a lost run."""
+
+        class Report:
+            subscribed_clients = ("client",)
+
+        peripheral, events = self.peripheral()
+        peripheral._reports = {1: Report()}
+        peripheral._read_subscriptions()
+        self.assertTrue(peripheral.is_subscribed)
+        self.assertEqual([kind for kind, _ in events], ["subscribed"])
+
+    def test_an_unreadable_list_is_named_once_and_then_left_alone(self) -> None:
+        """The collections projection is a package of its own, and it went missing.
+
+        Every read raised, the raise arrived inside a callback where nothing could
+        report it, and the window said "waiting for the target" over a link that
+        was up and subscribed. One line naming the package is the fix; five
+        hundred lines is a log nobody reads.
+        """
+
+        class Report:
+            @property
+            def subscribed_clients(self):
+                raise ModuleNotFoundError(
+                    "No module named 'winrt.windows.foundation.collections'")
+
+        peripheral, _ = self.peripheral()
+        peripheral._reports = {1: Report()}
+        with self.assertLogs("winborder.ble", level="WARNING") as captured:
+            for _ in range(5):
+                peripheral._read_subscriptions()
+        self.assertEqual(len(captured.output), 1, captured.output)
+        self.assertIn("winrt-Windows.Foundation.Collections", captured.output[0])
+        self.assertTrue(peripheral._subscriptions_unreadable)
 
 
 class TestAdvertisementStatus(unittest.TestCase):

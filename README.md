@@ -32,19 +32,21 @@ Get executable file or installer from [Releases Page](https://github.com/Gatongo
 Everything except the Bluetooth bindings uses the Python standard library and `ctypes`:
 
 ```
-pip install winrt-runtime winrt-Windows.Devices.Bluetooth \
-            winrt-Windows.Devices.Bluetooth.Advertisement \
-            winrt-Windows.Devices.Bluetooth.GenericAttributeProfile \
-            winrt-Windows.Storage.Streams winrt-Windows.Foundation
+pip install -r requirements.txt
 ```
 
 ## Usage
 
-Open the Bluetooth settings on the target and select your host Bluetooth adapter name. Each run advertises under a new random address, so a bond made before a restart no longer matches: forget the device on the target and pair it again.
+1. Run from the source tree with `python -m winborder`, or use a release build `winborder.exe`. The PC advertises as a Bluetooth LE HID device as soon as it starts, and keeps advertising until a target subscribes; the cursor does not cross until then.
+2. Leave Winborder running, and read the Devices page: it says which name this PC is advertising as. That is the PC's Bluetooth name, not its computer name.
+3. On the target, open its Bluetooth settings, find that name and select it.
+4. Watch the Winborder log, if the connection was succeed, you might see following logs:
+   * `the target is connected and reading the HID descriptor` means the target found the service.
+   * `the target is connected and listening` means it has subscribed and the keyboard and mouse will cross.
 
-Then run from the source tree with `python -m winborder`, or use a release build `winborder.exe`. The cursor stops crossing until the target has connected, so pair it first.
+Each time the app runs, it may use a new random address for broadcasting, in which case the pairing established before the restart will no longer match: Please forget the target device and then pair it again.
 
-If it works, move your mouse to the bottom of the screen, and the cursor will pass through the screen onto your device.
+If everything setup, move your mouse to the bottom of the screen, and the cursor will pass through the screen onto your device.
 
 ### Settings
 
@@ -70,13 +72,18 @@ python -m winborder --write-config
 
 ## Build
 
-The two scripts in `.github/tools` are what the release workflow runs. They need the runtime packages above plus PyInstaller:
+```
+python .github/tools/build.py
+```
 
-```
-pip install pyinstaller
-python .github/tools/build_exe.py
-python .github/tools/build_installer.py
-```
+Writes `dist\Winborder.exe`; the first run sets `.venv` up by itself.
+
+| Option | Description |
+| --- | --- |
+| `--console` | Keep a console window, for debugging. |
+| `--onedir` | Write a folder instead of one file. |
+| `--installer` | Also write the Setup.exe. Needs Inno Setup 6. |
+| `--install-inno` | Install Inno Setup with winget first. |
 
 ## License
 

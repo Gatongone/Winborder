@@ -47,11 +47,16 @@ def _load_winrt():
             BluetoothLEAdvertisementWatcher,
             BluetoothLEScanningMode,
         )
+        # An advertisement's service list is a WinRT collection, so reading one
+        # needs this module. Without it every advertisement failed to parse, the
+        # scan quietly listed nothing, and the list looked like an empty room.
+        from winrt.windows.foundation.collections import IVectorView  # noqa: F401
     except ImportError as exc:  # pragma: no cover - depends on the environment
         raise ScanUnavailable(
             "the WinRT projections are missing: pip install winrt-runtime "
             "winrt-Windows.Devices.Bluetooth "
-            "winrt-Windows.Devices.Bluetooth.Advertisement"
+            "winrt-Windows.Devices.Bluetooth.Advertisement "
+            "winrt-Windows.Foundation.Collections"
         ) from exc
     return BluetoothAdapter, BluetoothLEAdvertisementWatcher, BluetoothLEScanningMode
 

@@ -20,6 +20,10 @@ log = logging.getLogger("winborder.service")
 
 TICK_INTERVAL_S = 1.0 / 250.0
 SCREEN_REFRESH_TICKS = 250
+#: How often the link is asked who is subscribed, in ticks: once a second. Fast
+#: enough that a missed subscription event costs a moment, slow enough that the
+#: question is free.
+SUBSCRIPTION_REFRESH_TICKS = 250
 RECONNECT_INTERVAL_S = 2.0
 
 
@@ -264,6 +268,15 @@ class Service:
                 # notice worth saying again if the link is lost later.
                 self._refused_reason = None
             return
+        if kind == "report-map-read":
+            # The first thing a HID host asks for once it is on the link: the
+            # descriptor is what tells it what the reports mean, so a host that
+            # reads it has found the service and is about to subscribe. Without
+            # this line, "the target never arrived" and "the target arrived and
+            # stopped here" are the same silence, and that is the state the user
+            # cannot act on.
+            log.info("the target is connected and reading the HID descriptor")
+            return
         if kind == "started":
             # The one state that means the PC is on the air, in the words the
             # rule below gives: the service says it, the peripheral only details.
@@ -302,6 +315,12 @@ class Service:
         if link is None or self._sink is None:
             time.sleep(RECONNECT_INTERVAL_S)
             return
+
+        # The subscription event is the only one that says a target arrived, and
+        # an event that never fires looks like a target that never came. Asking
+        # the link instead costs nothing and keeps the window honest.
+        if self._ticks % SUBSCRIPTION_REFRESH_TICKS == 0:
+            link.refresh_subscriptions()
 
         # Link health is judged by reports the peripheral actually delivered, not
         # by how many the router produced: a report with no subscriber behind it

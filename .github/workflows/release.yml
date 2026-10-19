@@ -42,7 +42,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON }}
       - name: Install the runtime dependencies
-        run: pip install winrt-runtime winrt-Windows.Devices.Bluetooth winrt-Windows.Devices.Bluetooth.Advertisement winrt-Windows.Devices.Bluetooth.GenericAttributeProfile winrt-Windows.Storage.Streams winrt-Windows.Foundation
+        run: pip install -r requirements.txt
       - name: Run the tests
         run: python -m unittest discover -s tests
 
@@ -56,7 +56,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON }}
       - name: Install the build dependencies
-        run: pip install pyinstaller winrt-runtime winrt-Windows.Devices.Bluetooth winrt-Windows.Devices.Bluetooth.Advertisement winrt-Windows.Devices.Bluetooth.GenericAttributeProfile winrt-Windows.Storage.Streams winrt-Windows.Foundation
+        run: pip install -r requirements.txt pyinstaller
       - name: Stamp the tag's version into the source
         run: python .github/tools/version.py --set "${{ needs.version.outputs.number }}"
       - name: Build the executable

@@ -102,13 +102,18 @@ def _load_winrt():
             GattServiceProviderAdvertisingParameters,
         )
         from winrt.windows.foundation import Deferral
+        # Never used here directly: a GATT projection hands back WinRT
+        # collections, and reading one needs this module. Missing it surfaced as
+        # a failure inside a callback, which is the one place nothing can report
+        # it, so it is imported where a missing package has somewhere to go.
+        from winrt.windows.foundation.collections import IVectorView  # noqa: F401
         from winrt.windows.storage.streams import DataWriter
     except ImportError as exc:  # pragma: no cover - depends on the environment
         raise BleUnavailable(
             "the WinRT projections are missing: pip install winrt-runtime "
             "winrt-Windows.Devices.Bluetooth winrt-Windows.Devices.Bluetooth."
             "GenericAttributeProfile winrt-Windows.Storage.Streams "
-            "winrt-Windows.Foundation"
+            "winrt-Windows.Foundation winrt-Windows.Foundation.Collections"
         ) from exc
 
     return {
@@ -217,6 +222,10 @@ class BleHidPeripheral:
         self._reports: dict[int, object] = {}
         self._subscribed: set[int] = set()
         self._sub_lock = threading.Lock()
+        # True once a subscriber list could not be read at all: the reason is a
+        # broken installation, not a lost report, so it is said once and the
+        # question is not asked again.
+        self._subscriptions_unreadable = False
 
         self._state_keyboard = (0, 0, 0, 0, 0, 0, 0, 0)   # modifier, k0..k6
         self._state_buttons = 0
@@ -345,7 +354,8 @@ class BleHidPeripheral:
         # means a host that connects and reads the map leaves no trace at all --
         # and then "nothing happened" cannot be told apart from "no host ever
         # arrived", which is exactly the question a failed pairing asks.
-        self._serve_read(report_map, "the report map", lambda: HID_REPORT_MAP)
+        self._serve_read(report_map, "the report map", lambda: HID_REPORT_MAP,
+                         kind="report-map-read")
         await add_characteristic(
             svc, UUID_HID_INFO, GattCharacteristicProperties.READ,
             static=HID_INFORMATION, description="HID Information",
@@ -458,19 +468,24 @@ class BleHidPeripheral:
             return
         thread.call_soon_threadsafe(self._read_advertisement_status, provider)
 
-    def _serve_read(self, characteristic, what: str, value: "Callable[[], bytes]") -> None:
+    def _serve_read(self, characteristic, what: str, value: "Callable[[], bytes]",
+                    *, kind: str = "read") -> None:
         """Answer a read in application code, and say that it happened.
 
         Used for values that never change, which could equally be static: a
         static value is answered by the stack itself and leaves no trace, so a
         host that connects only to look at the descriptor would be invisible in
         the log.
+
+        ``kind`` names the event, because not every read is equally interesting:
+        the report map is the first thing a HID host asks for, and the service
+        shows that one to the user while the rest stay in the debug log.
         """
         api, loop = self._api, self._loop
 
         def read_requested(_sender, args):
             deferral = args.get_deferral()
-            self._emit("read", f"a host read {what}")
+            self._emit(kind, f"a host read {what}")
 
             async def respond():
                 try:
@@ -493,24 +508,12 @@ class BleHidPeripheral:
         loop = self._loop
 
         def subscribed_changed(sender, _args):
-            clients = list(sender.subscribed_clients)
-            with self._sub_lock:
-                if clients:
-                    self._subscribed.add(report_id)
-                else:
-                    self._subscribed.discard(report_id)
-                count = len(self._subscribed)
-            if clients:
-                if not self._serving:
-                    # Worth a line: "connected" before this process put anything
-                    # on the air is either another copy of the host sharing the
-                    # service or a target that kept the link across a restart, and
-                    # both change what the Device link row means.
-                    self._emit("adopted", "a subscriber was already attached "
-                                          "when the server started")
-                self._emit("subscribed", f"report {report_id}, {count} of 3 subscribed")
-            else:
-                self._emit("unsubscribed", f"report {report_id}, {count} of 3 subscribed")
+            try:
+                clients = bool(list(sender.subscribed_clients))
+            except Exception as exc:  # noqa: BLE001 - one event, not the link
+                self._subscription_read_failed(exc)
+                return
+            self._note_subscription(report_id, clients)
 
         def read_requested(sender, args):
             deferral = args.get_deferral()
@@ -571,6 +574,73 @@ class BleHidPeripheral:
     def is_subscribed(self) -> bool:
         with self._sub_lock:
             return bool(self._subscribed)
+
+    def _note_subscription(self, report_id: int, subscribed: bool) -> None:
+        """Record one report's subscriber, and say so when it changes.
+
+        The event and the poll below both end up here, so whichever of the two
+        noticed a target arriving, the log and the window hear it once and in
+        the same words.
+        """
+        with self._sub_lock:
+            if (report_id in self._subscribed) == subscribed:
+                return
+            if subscribed:
+                self._subscribed.add(report_id)
+            else:
+                self._subscribed.discard(report_id)
+            count = len(self._subscribed)
+        if not subscribed:
+            self._emit("unsubscribed", f"report {report_id}, {count} of 3 subscribed")
+            return
+        if not self._serving:
+            # Worth a line: "connected" before this process put anything on the
+            # air is either another copy of the host sharing the service or a
+            # target that kept the link across a restart, and both change what
+            # the Device link row means.
+            self._emit("adopted", "a subscriber was already attached "
+                                  "when the server started")
+        self._emit("subscribed", f"report {report_id}, {count} of 3 subscribed")
+
+    def refresh_subscriptions(self) -> None:
+        """Re-read each report's subscribers, on the loop's thread.
+
+        ``SubscribedClientsChanged`` is the only event that says a target
+        arrived, and an event that is not delivered looks exactly like a target
+        that never connected: the window waits while the target reports the link
+        as up, which is the one state a user cannot tell apart from a fault. The
+        same fact is a property, so asking for it once a second turns a missed
+        event into a second of delay rather than a whole run.
+        """
+        thread = self._thread
+        if thread is None or self._subscriptions_unreadable:
+            return
+        thread.call_soon_threadsafe(self._read_subscriptions)
+
+    def _read_subscriptions(self) -> None:
+        for report_id, characteristic in list(self._reports.items()):
+            try:
+                clients = bool(list(characteristic.subscribed_clients))
+            except Exception as exc:  # noqa: BLE001 - one report, not the link
+                self._subscription_read_failed(exc)
+                return
+            self._note_subscription(report_id, clients)
+
+    def _subscription_read_failed(self, exc: BaseException) -> None:
+        """Report a subscriber list that cannot be read, once for the whole run.
+
+        The list arrives as a WinRT collection, and reading one needs the
+        collections projection, which is a package of its own. Missing it made
+        every read raise inside a callback and inside a poll -- and a callback
+        has nowhere to report it, so the window showed "waiting for the target"
+        over a link that was up and subscribed. Said here, once, with the package
+        that fixes it.
+        """
+        if self._subscriptions_unreadable:
+            return
+        self._subscriptions_unreadable = True
+        log.warning("cannot read which reports are subscribed: %s "
+                    "(pip install winrt-Windows.Foundation.Collections)", exc)
 
     @property
     def advertising_status(self) -> str:
@@ -753,6 +823,14 @@ class BleFrameSink:
     @property
     def peripheral(self) -> BleHidPeripheral:
         return self._peripheral
+
+    def refresh_subscriptions(self) -> None:
+        """Re-read who is subscribed, for the service's watchdog.
+
+        Kept here so the service keeps talking to the sink rather than reaching
+        through it to the radio.
+        """
+        self._peripheral.refresh_subscriptions()
 
     def send(self, kind: str, payload: bytes) -> bool:
         """FrameSink entry point. Returns True when the report was delivered."""
