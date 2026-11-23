@@ -20,29 +20,6 @@ shown as the name itself, so a half-finished rename is visible rather than blank
 Only the window is translated. The log lines the host produces are
 diagnostic output and stay in English, so they can be searched for and compared
 between versions.
-
-How the text is written, in every language -- the rules come from reviewing the
-wording with the person who uses the program:
-
-* Say what a setting *is*, not what the reader should do with it. Noun phrases,
-  not instructions: "Interval before the same edge can be crossed again", not
-  "Wait this long before crossing again".
-* No second person and no imperatives. "Click a field and press a key" describes
-  the author's own UI; "Key remapping for the target device; right-click a field
-  to choose from the full list" describes the field.
-* No rhetorical questions in titles or descriptions. A dialog that really asks
-  something asks it formally: "Reset all settings to their default values?".
-* One name per thing. The machine this program runs on is the *PC* in English and
-  主机 in Chinese; the device it drives is the *target device*, or just the target
-  where a label is short. Never "host": the word named both sides of the link on
-  this page and its opposite on that one, and it is gone from the strings
-  entirely. Nor a synonym invented halfway through, nor 被控端 in one label and
-  目标设备 in the next. Chinese says 指针 and never 光标, and writes 此, never
-  这个.
-* Technical phrasing, not conversational: "the current value is {kind}", not
-  "got {kind}"; "see the Log", not "the Log will tell you why".
-* Short is a feature, not a compromise. A note that repeats what the page title
-  already says is a note that will not be read.
 """
 
 from __future__ import annotations
